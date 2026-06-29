@@ -45,8 +45,15 @@ pkill -f "ssh.*rlwy" 2>/dev/null
 sleep 1
 
 # === INICIAR MICROSOCKS ===
-echo -e "${YELLOW}[2/3] Iniciando proxy SOCKS5...${NC}"
-microsocks -i 0.0.0.0 -p $PROXY_PORT -u $PROXY_USER -P $PROXY_PASS &
+# IMPORTANTE: o motor Chromium (Chrome e o navegador do Fingerprint Manager)
+# NAO suporta SOCKS5 com usuario/senha -> isso causa ERR_NO_SUPPORTED_PROXIES.
+# Por isso o microsocks roda SEM autenticacao.
+# Para nao deixar o proxy aberto na internet, o microsocks escuta apenas em
+# 127.0.0.1 (localhost) do celular. O tunel SSH reverso entrega o trafego
+# do Railway nesse localhost, entao continua funcionando, mas ninguem na
+# internet consegue acessar o microsocks diretamente.
+echo -e "${YELLOW}[2/3] Iniciando proxy SOCKS5 (sem senha, restrito ao tunel)...${NC}"
+microsocks -i 127.0.0.1 -p $PROXY_PORT &
 MICRO_PID=$!
 sleep 1
 
