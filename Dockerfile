@@ -38,7 +38,10 @@ RUN echo "Port 2222" >> /etc/ssh/sshd_config && \
     echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config && \
     echo "PermitOpen any" >> /etc/ssh/sshd_config && \
     echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config && \
-    echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config
+    echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config && \
+    echo "Compression no" >> /etc/ssh/sshd_config && \
+    echo "UseDNS no" >> /etc/ssh/sshd_config && \
+    echo "IPQoS throughput" >> /etc/ssh/sshd_config
 
 # Gerar host keys
 RUN ssh-keygen -A

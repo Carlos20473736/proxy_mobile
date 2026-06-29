@@ -77,15 +77,22 @@ echo -e "${GREEN}═════════════════════
 while true; do
     echo -e "${YELLOW}[$(date +%H:%M:%S)] Conectando SSH...${NC}"
 
+    # OTIMIZACOES DE VELOCIDADE:
+    # - Compression=no: trafego web ja vem comprimido (HTTPS/imagens/video);
+    #   comprimir de novo so gasta CPU do celular e atrasa. Desligar acelera.
+    # - Cipher e MAC leves (chacha20/aes-gcm): menos CPU no celular = mais vazao.
+    # - ServerAliveInterval mais alto: menos overhead de keepalive.
     sshpass -p "$RAILWAY_PASS" ssh \
         -p $RAILWAY_PORT \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
-        -o ServerAliveInterval=15 \
+        -o ServerAliveInterval=30 \
         -o ServerAliveCountMax=3 \
         -o TCPKeepAlive=yes \
         -o ExitOnForwardFailure=yes \
-        -o Compression=yes \
+        -o Compression=no \
+        -o Ciphers=chacha20-poly1305@openssh.com,aes128-gcm@openssh.com \
+        -o IPQoS=throughput \
         -N \
         -R 0.0.0.0:9050:localhost:$PROXY_PORT \
         ${RAILWAY_USER}@${RAILWAY_HOST}
