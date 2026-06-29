@@ -6,9 +6,9 @@
 # o microsocks e o Railway.
 # ============================================
 
-# === CONFIGURAÇÕES (EDITE AQUI) ===
-RAILWAY_HOST="SEU_DOMINIO.proxy.rlwy.net"  # Domínio TCP do Railway (porta SSH)
-RAILWAY_SSH_PORT="PORTA_SSH"                # Porta SSH pública do Railway
+# === CONFIGURAÇÕES ===
+RAILWAY_HOST="nozomi.proxy.rlwy.net"
+RAILWAY_PORT="33719"
 RAILWAY_USER="tunnel"
 RAILWAY_PASS="proxypass123"
 
@@ -25,14 +25,13 @@ NC='\033[0m'
 
 clear
 echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║  PROXY MOBILE - Railway (Brasil)         ║${NC}"
+echo -e "${CYAN}║  PROXY MOBILE - Railway (US East)         ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
 # === MATAR PROCESSOS ANTERIORES ===
 echo -e "${YELLOW}[1/3] Limpando processos anteriores...${NC}"
 pkill -f microsocks 2>/dev/null
-pkill -f "ssh.*railway" 2>/dev/null
 pkill -f "ssh.*rlwy" 2>/dev/null
 sleep 1
 
@@ -52,19 +51,18 @@ fi
 # === CONECTAR AO RAILWAY ===
 echo -e "${YELLOW}[3/3] Conectando ao Railway...${NC}"
 echo ""
-echo -e "${CYAN}Configuração:${NC}"
-echo -e "  Host Railway: $RAILWAY_HOST:$RAILWAY_SSH_PORT"
-echo -e "  Proxy local:  localhost:$PROXY_PORT"
-echo -e "  Forwarding:   porta 1080 no Railway → localhost:$PROXY_PORT"
+echo -e "${CYAN}Dados:${NC}"
+echo -e "  Railway: $RAILWAY_HOST:$RAILWAY_PORT"
+echo -e "  Túnel:   porta 9050 (Railway) ← porta $PROXY_PORT (celular)"
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════${NC}"
 
 # Loop de reconexão
 while true; do
-    echo -e "${YELLOW}[TÚNEL] Conectando ao Railway...${NC}"
+    echo -e "${YELLOW}[$(date +%H:%M:%S)] Conectando SSH...${NC}"
     
     sshpass -p "$RAILWAY_PASS" ssh \
-        -p $RAILWAY_SSH_PORT \
+        -p $RAILWAY_PORT \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ServerAliveInterval=15 \
@@ -74,11 +72,11 @@ while true; do
         -o Compression=yes \
         -o Ciphers=aes128-gcm@openssh.com \
         -N \
-        -R 0.0.0.0:1080:localhost:$PROXY_PORT \
+        -R 0.0.0.0:9050:localhost:$PROXY_PORT \
         ${RAILWAY_USER}@${RAILWAY_HOST}
     
     EXIT_CODE=$?
-    echo -e "${RED}[TÚNEL] Desconectado (código: $EXIT_CODE)${NC}"
-    echo -e "${YELLOW}[TÚNEL] Reconectando em 2s...${NC}"
+    echo -e "${RED}[$(date +%H:%M:%S)] Desconectado (código: $EXIT_CODE)${NC}"
+    echo -e "${YELLOW}Reconectando em 2s...${NC}"
     sleep 2
 done

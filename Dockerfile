@@ -1,13 +1,21 @@
 FROM alpine:3.19
 
-# Instalar OpenSSH server
-RUN apk add --no-cache openssh-server bash
+# Instalar OpenSSH server, sslh (multiplexador de protocolo) e microsocks
+RUN apk add --no-cache openssh-server bash sslh
+
+# Compilar microsocks (proxy SOCKS5 leve)
+RUN apk add --no-cache gcc musl-dev git make && \
+    git clone https://github.com/rofl0r/microsocks.git /tmp/microsocks && \
+    cd /tmp/microsocks && make && cp microsocks /usr/local/bin/ && \
+    rm -rf /tmp/microsocks && \
+    apk del gcc musl-dev git make
 
 # Criar diretório SSH
 RUN mkdir -p /run/sshd
 
-# Configurar SSH para aceitar reverse port forwarding
-RUN echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && \
+# Configurar SSH na porta 2222 (interna, sslh redireciona)
+RUN echo "Port 2222" >> /etc/ssh/sshd_config && \
+    echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && \
     echo "GatewayPorts yes" >> /etc/ssh/sshd_config && \
     echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config && \
     echo "ClientAliveInterval 15" >> /etc/ssh/sshd_config && \
@@ -16,8 +24,7 @@ RUN echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && \
     echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config && \
     echo "PermitOpen any" >> /etc/ssh/sshd_config && \
     echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config && \
-    echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config && \
-    echo "Port 2222" >> /etc/ssh/sshd_config
+    echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config
 
 # Gerar host keys
 RUN ssh-keygen -A
@@ -30,7 +37,6 @@ RUN adduser -D -s /bin/bash tunnel && \
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
-EXPOSE 2222
 EXPOSE 1080
 
 CMD ["/start.sh"]
