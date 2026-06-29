@@ -30,6 +30,16 @@ echo ""
 # Garantir diretório do sshd
 mkdir -p /run/sshd
 
+# === TUNING DE REDE (velocidade maxima) ===
+# Aumenta os buffers TCP e habilita otimizacoes do kernel para mais vazao.
+# (Roda em best-effort; no Railway alguns sysctls podem ser ignorados.)
+sysctl -w net.core.rmem_max=16777216 2>/dev/null
+sysctl -w net.core.wmem_max=16777216 2>/dev/null
+sysctl -w net.ipv4.tcp_rmem='4096 87380 16777216' 2>/dev/null
+sysctl -w net.ipv4.tcp_wmem='4096 65536 16777216' 2>/dev/null
+sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null
+sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null
+
 # Iniciar SSH server em background
 /usr/sbin/sshd -e
 
@@ -39,7 +49,11 @@ mkdir -p /run/sshd
 # - Detecta SSH (bytes iniciais "SSH-") → redireciona para 127.0.0.1:2222
 # - Detecta SOCKS5                       → redireciona para 127.0.0.1:9050
 # - Qualquer outro protocolo (--anyprot) → redireciona para 127.0.0.1:9050
-exec sslh -f \
+# Usamos sslh-select: um unico processo lida com TODAS as conexoes via select(),
+# em vez de criar um processo novo por conexao (sslh fork). Para navegacao web
+# com muitas requisicoes paralelas isso reduz o uso de CPU/memoria e melhora a
+# vazao agregada.
+exec /usr/sbin/sslh-select -f \
     -p 0.0.0.0:1080 \
     --ssh 127.0.0.1:2222 \
     --socks5 127.0.0.1:9050 \
