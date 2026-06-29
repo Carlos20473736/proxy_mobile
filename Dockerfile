@@ -1,16 +1,30 @@
-FROM alpine:3.19
+FROM debian:bookworm-slim
 
-# Instalar OpenSSH server, sslh (multiplexador de protocolo) e microsocks
-RUN apk add --no-cache openssh-server bash sslh
+# Evitar prompts interativos durante o build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Instalar OpenSSH server, sslh (multiplexador de protocolo) e dependências de build do microsocks
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        openssh-server \
+        sslh \
+        bash \
+        ca-certificates \
+        gcc \
+        libc6-dev \
+        git \
+        make && \
+    rm -rf /var/lib/apt/lists/*
 
 # Compilar microsocks (proxy SOCKS5 leve)
-RUN apk add --no-cache gcc musl-dev git make && \
-    git clone https://github.com/rofl0r/microsocks.git /tmp/microsocks && \
+RUN git clone https://github.com/rofl0r/microsocks.git /tmp/microsocks && \
     cd /tmp/microsocks && make && cp microsocks /usr/local/bin/ && \
     rm -rf /tmp/microsocks && \
-    apk del gcc musl-dev git make
+    apt-get purge -y gcc libc6-dev git make && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
 
-# Criar diretório SSH
+# Criar diretório necessário para o sshd
 RUN mkdir -p /run/sshd
 
 # Configurar SSH na porta 2222 (interna, sslh redireciona)
@@ -30,7 +44,7 @@ RUN echo "Port 2222" >> /etc/ssh/sshd_config && \
 RUN ssh-keygen -A
 
 # Criar usuário para o túnel
-RUN adduser -D -s /bin/bash tunnel && \
+RUN useradd -m -s /bin/bash tunnel && \
     echo "tunnel:proxypass123" | chpasswd
 
 # Script de inicialização

@@ -4,9 +4,18 @@
 # ============================================
 # Execute este script no Termux após configurar
 # o microsocks e o Railway.
+#
+# ATENÇÃO (causa comum de "Connection reset/closed"):
+#   RAILWAY_HOST/RAILWAY_PORT abaixo DEVEM apontar para o
+#   TCP Proxy que o Railway gerou para a porta interna 1080
+#   (o sslh multiplexa SSH e SOCKS5 na MESMA porta 1080).
+#   NÃO use uma porta que aponte para nada além da 1080.
 # ============================================
 
 # === CONFIGURAÇÕES ===
+# Host e porta do TCP Proxy do Railway que aponta para a porta interna 1080.
+# Ex.: se o Railway gerou "nozomi.proxy.rlwy.net:33719" para a porta 1080,
+# use exatamente esses valores aqui.
 RAILWAY_HOST="nozomi.proxy.rlwy.net"
 RAILWAY_PORT="33719"
 RAILWAY_USER="tunnel"
@@ -52,7 +61,7 @@ fi
 echo -e "${YELLOW}[3/3] Conectando ao Railway...${NC}"
 echo ""
 echo -e "${CYAN}Dados:${NC}"
-echo -e "  Railway: $RAILWAY_HOST:$RAILWAY_PORT"
+echo -e "  Railway: $RAILWAY_HOST:$RAILWAY_PORT (porta interna 1080 -> sslh)"
 echo -e "  Túnel:   porta 9050 (Railway) ← porta $PROXY_PORT (celular)"
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════${NC}"
@@ -60,7 +69,7 @@ echo -e "${GREEN}═════════════════════
 # Loop de reconexão
 while true; do
     echo -e "${YELLOW}[$(date +%H:%M:%S)] Conectando SSH...${NC}"
-    
+
     sshpass -p "$RAILWAY_PASS" ssh \
         -p $RAILWAY_PORT \
         -o StrictHostKeyChecking=no \
@@ -70,11 +79,10 @@ while true; do
         -o TCPKeepAlive=yes \
         -o ExitOnForwardFailure=yes \
         -o Compression=yes \
-        -o Ciphers=aes128-gcm@openssh.com \
         -N \
         -R 0.0.0.0:9050:localhost:$PROXY_PORT \
         ${RAILWAY_USER}@${RAILWAY_HOST}
-    
+
     EXIT_CODE=$?
     echo -e "${RED}[$(date +%H:%M:%S)] Desconectado (código: $EXIT_CODE)${NC}"
     echo -e "${YELLOW}Reconectando em 2s...${NC}"

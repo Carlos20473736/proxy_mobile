@@ -13,7 +13,7 @@
 #   porta 9050 do container ← localhost:8899 do celular (microsocks)
 #
 # O Fingerprint Manager conecta como SOCKS5:
-#   nozomi.proxy.rlwy.net:33719 → porta 1080 → sslh → porta 9050 → celular
+#   <host>.proxy.rlwy.net:<porta> → porta 1080 → sslh → porta 9050 → celular
 # ============================================
 
 echo "╔══════════════════════════════════════════╗"
@@ -27,13 +27,20 @@ echo ""
 echo "Aguardando celular conectar via SSH..."
 echo ""
 
+# Garantir diretório do sshd
+mkdir -p /run/sshd
+
 # Iniciar SSH server em background
 /usr/sbin/sshd -e
 
 # Iniciar sslh na porta 1080
-# - Detecta SSH (bytes iniciais SSH-) → redireciona para 127.0.0.1:2222
-# - Qualquer outro protocolo (SOCKS5) → redireciona para 127.0.0.1:9050
+# IMPORTANTE: a versão do sslh no Debian usa "-p <addr>" para a porta de escuta
+# (NÃO existe a opção "--listen" nesta versão).
+# - Detecta SSH (bytes iniciais "SSH-") → redireciona para 127.0.0.1:2222
+# - Detecta SOCKS5                       → redireciona para 127.0.0.1:9050
+# - Qualquer outro protocolo (--anyprot) → redireciona para 127.0.0.1:9050
 exec sslh -f \
-    --listen 0.0.0.0:1080 \
+    -p 0.0.0.0:1080 \
     --ssh 127.0.0.1:2222 \
+    --socks5 127.0.0.1:9050 \
     --anyprot 127.0.0.1:9050
