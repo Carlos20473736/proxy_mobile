@@ -1,54 +1,56 @@
-# Proxy Mobile via Railway - v3.0 (CHISEL)
+# Proxy Mobile via Railway - v3.1
 
-Proxy mobile de alta velocidade que roteia tráfego pelo IP 5G/4G do celular via **chisel** (túnel HTTP2/WebSocket).
+Proxy mobile que roteia tráfego pelo IP 5G/4G do celular via SSH otimizado.
 
-**v3.0** substitui SSH+sslh+microsocks por um único binário (chisel) que é **muito mais rápido**.
-
----
-
-## Por que chisel é mais rápido que SSH?
-
-| Aspecto | SSH (v2.0) | Chisel (v3.0) |
-|---------|-----------|---------------|
-| Protocolo | TCP puro | HTTP2 (multiplexing nativo) |
-| Streams | 1 canal TCP | Múltiplos streams paralelos |
-| Overhead | Alto (criptografia + MAC + rekey) | Baixo (HTTP2 frames) |
-| Componentes | sslh + sshd + microsocks | 1 binário (chisel) |
-| Reconexão | Script bash manual | Automática com backoff |
-| CPU no celular | Alta (cipher + MAC por pacote) | Baixa |
+**v3.1** remove o sslh (multiplexador) e usa SSH direto + 2 portas no Railway, eliminando 1 hop de processamento.
 
 ---
 
 ## Arquitetura
 
 ```
-Fingerprint Manager → Railway (porta 1080) → chisel tunnel (HTTP2) → celular (5G/4G)
-                         SOCKS5                                         resolve DNS + navega
+Fingerprint Manager → Railway:9050 (TCP Proxy) → túnel SSH → celular (5G/4G)
+                        SOCKS5                                  microsocks
 ```
 
-| Componente | Função |
+| Porta Railway | Função |
+|---------------|--------|
+| 1080 (TCP Proxy: nozomi:33719) | SSH direto — celular conecta aqui |
+| 9050 (TCP Proxy: reseau:51887) | SOCKS5 — Fingerprint Manager conecta aqui |
+
+---
+
+## Otimizações de velocidade
+
+| Otimização | Efeito |
 |------------|--------|
-| **chisel server** (Railway, porta 1080) | Aceita conexões SOCKS5 e tunela via HTTP2 |
-| **chisel client** (celular) | Recebe tráfego e navega usando IP mobile |
+| Sem sslh | -1 hop de processamento, menos latência |
+| SSH direto na porta 1080 | Conexão imediata (sem detecção de protocolo) |
+| Ciphers: aes128-gcm | Usa aceleração AES de hardware do ARM |
+| Compression: no | Menos CPU no celular |
+| RekeyLimit: 0 0 | Sem pausas de renegociação |
+| TCP BBR | Melhor para redes móveis |
+| Buffers TCP 16MB | Mais throughput |
+| TCP Fast Open | -1 RTT por conexão |
 
 ---
 
 ## Deploy no Railway
 
-1. Faça fork ou suba este repositório no GitHub.
-2. No [Railway](https://railway.app/), crie um novo projeto a partir do repo.
-3. Após o deploy, vá em **Settings → Networking → TCP Proxy**.
-4. Gere um TCP Proxy para a porta **1080**.
-5. Anote o host e porta gerados (ex: `nozomi.proxy.rlwy.net:33719`).
+1. Suba este repositório no Railway.
+2. Crie **2 TCP Proxies**:
+   - Porta **1080** (para o celular conectar via SSH)
+   - Porta **9050** (para o Fingerprint Manager usar como SOCKS5)
+3. Anote os hosts e portas gerados.
 
 ---
 
 ## Configurar o Celular (Termux)
 
-1. Edite `start-celular.sh` com os dados do Railway:
+1. Edite `start-celular.sh`:
    ```bash
-   RAILWAY_HOST="nozomi.proxy.rlwy.net"   # Host do TCP Proxy
-   RAILWAY_PORT="33719"                    # Porta do TCP Proxy
+   RAILWAY_HOST="nozomi.proxy.rlwy.net"   # Host do TCP Proxy porta 1080
+   RAILWAY_PORT="33719"                    # Porta do TCP Proxy porta 1080
    ```
 
 2. Execute:
@@ -57,37 +59,21 @@ Fingerprint Manager → Railway (porta 1080) → chisel tunnel (HTTP2) → celul
    ./start-celular.sh
    ```
 
-   Na primeira execução, o script baixa e instala o chisel automaticamente.
-
 ---
 
 ## Configurar o Fingerprint Manager
 
 | Campo | Valor |
 |-------|-------|
-| **Tipo** | SOCKS5 |
-| **Host** | Host do Railway (ex: `nozomi.proxy.rlwy.net`) |
-| **Porta** | Porta do TCP Proxy (ex: `33719`) |
-| **User** | *(deixar vazio)* |
-| **Pass** | *(deixar vazio)* |
+| Tipo | SOCKS5 |
+| Host | reseau.proxy.rlwy.net |
+| Porta | 51887 |
+| User | *(vazio)* |
+| Pass | *(vazio)* |
 
 ---
 
 ## Diagnóstico
 
-Se a velocidade estiver baixa:
-
-1. **Sinal 5G/4G** — O gargalo é sempre a rede móvel.
-2. **Wake lock** — Mantenha o Termux com wake lock ativo.
-3. **Otimização de bateria** — Desabilite para o Termux.
-4. **Wi-Fi desligado** — Force o celular a usar apenas 5G/4G.
-
----
-
-## Segurança
-
-| Camada | Proteção |
-|--------|----------|
-| Chisel tunnel | Criptografia SSH embutida no protocolo |
-| Autenticação | `tunnel:proxypass123` (altere em produção) |
-| SOCKS5 sem auth | Seguro pois só funciona via túnel chisel |
+- **Velocidade baixa**: O gargalo é a rede 5G/4G do celular + overhead do SSH.
+- **Desconexões**: Mantenha o Termux com wake lock ativo e desabilite otimização de bateria.
