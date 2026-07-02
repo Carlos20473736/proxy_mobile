@@ -118,4 +118,4 @@ exec chisel client \
     --keepalive 10s \
     --auth ${RAILWAY_USER}:${RAILWAY_PASS} \
     "http://${CONNECT_HOST}:${RAILWAY_PORT}" \
-    R:socks
+    R:0.0.0.0:9050:socks

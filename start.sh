@@ -4,31 +4,27 @@
 # ============================================
 # ARQUITETURA:
 #
-# Porta 1080 (exposta pelo Railway TCP Proxy)
-#   │
-#   └── chisel server (HTTP2/WebSocket tunnel)
-#         │
-#         └── Celular conecta como chisel client
-#             com R:socks (reverse SOCKS5)
+# O Railway expõe DUAS portas públicas:
+#   - Porta 1080 → chisel server (celular conecta aqui via WebSocket)
+#   - Porta 9050 → SOCKS5 reverso (Fingerprint Manager conecta aqui)
 #
-# O celular roda chisel client com "R:socks":
-#   - O servidor escuta conexões SOCKS5 na porta 1080
-#   - As conexões são tuneladas via HTTP2 até o celular
-#   - O celular resolve e faz as requisições usando seu IP 4G/5G
+# O celular roda chisel client com "R:0.0.0.0:9050:socks":
+#   - O servidor abre porta 9050 como SOCKS5
+#   - Conexões SOCKS5 são tuneladas via HTTP2 até o celular
+#   - O celular resolve DNS e navega usando seu IP 5G/4G
 #
 # VANTAGENS vs SSH:
-# - HTTP2 multiplexing (múltiplos streams em 1 conexão TCP)
-# - Sem overhead de criptografia pesada do SSH
-# - Reconexão automática com backoff exponencial
-# - Passa por proxies/firewalls corporativos
-# - Muito mais rápido em redes de alta latência
+# - HTTP2 multiplexing (múltiplos streams paralelos)
+# - Menos overhead de criptografia
+# - Reconexão automática com backoff
+# - Muito mais rápido
 # ============================================
 
 echo "╔══════════════════════════════════════════╗"
 echo "║  Railway Proxy Mobile v3.0 (CHISEL)      ║"
 echo "╠══════════════════════════════════════════╣"
-echo "║  Porta 1080: chisel server               ║"
-echo "║  Celular: chisel client R:socks           ║"
+echo "║  Porta 1080: chisel server (tunnel)       ║"
+echo "║  Porta 9050: SOCKS5 reverso (proxy)       ║"
 echo "║  Protocolo: HTTP2 + WebSocket             ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
@@ -59,11 +55,19 @@ echo ""
 # ============================================
 # === INICIAR CHISEL SERVER ===
 # ============================================
-# --reverse: permite que o client faça reverse port forwarding (R:socks)
-# --port 1080: escuta na porta que o Railway expõe
-# --keepalive 10s: keepalive agressivo para detectar quedas
-# --auth: autenticação simples para segurança
+# --reverse: permite R:socks (reverse SOCKS5)
+# --port 1080: escuta WebSocket na porta 1080 (celular conecta aqui)
+# --keepalive 10s: detecta quedas rápido
+# --auth: autenticação
+#
+# O client vai fazer R:0.0.0.0:9050:socks
+# Isso abre a porta 9050 no container como SOCKS5
+# O Railway precisa de um TCP Proxy apontando para a porta 9050
 echo "[OK] Iniciando chisel server na porta 1080..."
+echo ""
+echo "IMPORTANTE: Certifique-se de ter 2 TCP Proxies no Railway:"
+echo "  1. Porta 1080 → para o celular conectar (chisel tunnel)"
+echo "  2. Porta 9050 → para o Fingerprint Manager (SOCKS5)"
 echo ""
 echo "Aguardando celular conectar..."
 echo ""
