@@ -42,14 +42,40 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 # === MATAR PROCESSOS ANTERIORES ===
-echo -e "${YELLOW}[1/3] Limpando processos anteriores...${NC}"
+echo -e "${YELLOW}[1/4] Limpando processos anteriores...${NC}"
 pkill -f chisel 2>/dev/null
 pkill -f microsocks 2>/dev/null
 pkill -f "ssh.*rlwy" 2>/dev/null
 sleep 1
 
+# === CORRIGIR DNS DO TERMUX ===
+echo -e "${YELLOW}[2/4] Configurando DNS...${NC}"
+
+# O Termux às vezes não tem resolver DNS funcionando em [::1]:53
+# Vamos resolver o hostname para IP antes de conectar
+RAILWAY_IP=$(getent hosts "$RAILWAY_HOST" 2>/dev/null | awk '{print $1}' | head -1)
+
+if [ -z "$RAILWAY_IP" ]; then
+    # Fallback: usar dig ou nslookup ou host
+    RAILWAY_IP=$(dig +short "$RAILWAY_HOST" 2>/dev/null | head -1)
+fi
+
+if [ -z "$RAILWAY_IP" ]; then
+    # Fallback 2: usar ping para resolver
+    RAILWAY_IP=$(ping -c 1 -W 2 "$RAILWAY_HOST" 2>/dev/null | grep -oP '\(\K[0-9.]+' | head -1)
+fi
+
+if [ -z "$RAILWAY_IP" ]; then
+    echo -e "${RED}  ✗ Não conseguiu resolver DNS de $RAILWAY_HOST${NC}"
+    echo -e "${YELLOW}  Tentando conectar pelo hostname mesmo...${NC}"
+    CONNECT_HOST="$RAILWAY_HOST"
+else
+    echo -e "${GREEN}  ✓ DNS resolvido: $RAILWAY_HOST → $RAILWAY_IP${NC}"
+    CONNECT_HOST="$RAILWAY_IP"
+fi
+
 # === VERIFICAR/INSTALAR CHISEL ===
-echo -e "${YELLOW}[2/3] Verificando chisel...${NC}"
+echo -e "${YELLOW}[3/4] Verificando chisel...${NC}"
 if ! command -v chisel &>/dev/null; then
     echo -e "${YELLOW}  → Instalando chisel v${CHISEL_VERSION}...${NC}"
     
@@ -71,18 +97,17 @@ if ! command -v chisel &>/dev/null; then
         echo -e "${GREEN}  ✓ Chisel instalado com sucesso${NC}"
     else
         echo -e "${RED}  ✗ Falha ao instalar chisel!${NC}"
-        echo -e "${YELLOW}  Tente manualmente: pkg install chisel${NC}"
         exit 1
     fi
 else
-    echo -e "${GREEN}  ✓ Chisel já instalado ($(chisel --version 2>/dev/null || echo 'ok'))${NC}"
+    echo -e "${GREEN}  ✓ Chisel já instalado${NC}"
 fi
 
 # === CONECTAR AO RAILWAY ===
-echo -e "${YELLOW}[3/3] Conectando ao Railway via chisel...${NC}"
+echo -e "${YELLOW}[4/4] Conectando ao Railway via chisel...${NC}"
 echo ""
 echo -e "${CYAN}Configuração:${NC}"
-echo -e "  Servidor: ${RAILWAY_HOST}:${RAILWAY_PORT}"
+echo -e "  Servidor: ${CONNECT_HOST}:${RAILWAY_PORT}"
 echo -e "  Modo: Reverse SOCKS5 (R:socks)"
 echo -e "  Protocolo: HTTP2/WebSocket"
 echo ""
@@ -103,9 +128,9 @@ echo ""
 #   O celular resolve DNS e faz as conexões usando seu IP 5G/4G
 #
 # --keepalive 10s = detecta queda rápido
-# O chisel já tem reconexão automática com backoff exponencial embutida!
+# Reconexão automática com backoff exponencial embutida!
 exec chisel client \
     --keepalive 10s \
     --auth ${RAILWAY_USER}:${RAILWAY_PASS} \
-    "http://${RAILWAY_HOST}:${RAILWAY_PORT}" \
+    "http://${CONNECT_HOST}:${RAILWAY_PORT}" \
     R:socks
