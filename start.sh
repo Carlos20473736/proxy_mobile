@@ -2,7 +2,7 @@
 # ============================================
 # Railway Proxy Mobile - Multiplexador v2.0
 # ============================================
-# ARQUITETURA OTIMIZADA:
+# ARQUITETURA:
 #
 # Porta 1080 (exposta pelo Railway TCP Proxy)
 #   │
@@ -14,14 +14,6 @@
 #
 # O Fingerprint Manager conecta como SOCKS5:
 #   <host>.proxy.rlwy.net:<porta> → porta 1080 → sslh → porta 9050 → celular
-#
-# OTIMIZAÇÕES v2.0:
-# - Buffers TCP maximizados (16MB)
-# - TCP BBR congestion control (melhor em redes móveis)
-# - TCP Fast Open (reduz latência de handshake)
-# - Keepalive agressivo para detectar quedas rápido
-# - sslh-select com timeout otimizado
-# - Desabilitado Nagle (TCP_NODELAY via sysctl)
 # ============================================
 
 echo "╔══════════════════════════════════════════╗"
@@ -39,10 +31,11 @@ echo ""
 mkdir -p /run/sshd
 
 # ============================================
-# === TUNING DE REDE AGRESSIVO ===
+# === TUNING DE REDE ===
 # ============================================
+# (Best-effort: no Railway alguns sysctls podem ser read-only)
 
-# --- Buffers TCP grandes (16MB) para maximizar throughput ---
+# Buffers TCP grandes (16MB) para maximizar throughput
 sysctl -w net.core.rmem_max=16777216 2>/dev/null
 sysctl -w net.core.wmem_max=16777216 2>/dev/null
 sysctl -w net.core.rmem_default=1048576 2>/dev/null
@@ -50,39 +43,33 @@ sysctl -w net.core.wmem_default=1048576 2>/dev/null
 sysctl -w net.ipv4.tcp_rmem='4096 1048576 16777216' 2>/dev/null
 sysctl -w net.ipv4.tcp_wmem='4096 1048576 16777216' 2>/dev/null
 
-# --- Backlog e filas maiores (mais conexões simultâneas) ---
+# Backlog e filas maiores
 sysctl -w net.core.somaxconn=4096 2>/dev/null
 sysctl -w net.core.netdev_max_backlog=5000 2>/dev/null
-sysctl -w net.ipv4.tcp_max_syn_backlog=4096 2>/dev/null
 
-# --- TCP Fast Open (reduz 1 RTT no handshake) ---
+# TCP Fast Open
 sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null
 
-# --- BBR congestion control (melhor para redes móveis/instáveis) ---
+# BBR congestion control (melhor para redes móveis)
 sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null
 
-# --- Otimizações de latência ---
+# Não resetar janela TCP após idle
 sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null
 sysctl -w net.ipv4.tcp_no_metrics_save=1 2>/dev/null
-sysctl -w net.ipv4.tcp_mtu_probing=1 2>/dev/null
-sysctl -w net.ipv4.tcp_timestamps=1 2>/dev/null
-sysctl -w net.ipv4.tcp_sack=1 2>/dev/null
-sysctl -w net.ipv4.tcp_window_scaling=1 2>/dev/null
 
-# --- Keepalive agressivo (detecta conexão morta em ~30s) ---
+# MTU probing (descobre MTU ideal automaticamente)
+sysctl -w net.ipv4.tcp_mtu_probing=1 2>/dev/null
+
+# Keepalive agressivo (detecta conexão morta em ~30s)
 sysctl -w net.ipv4.tcp_keepalive_time=10 2>/dev/null
 sysctl -w net.ipv4.tcp_keepalive_intvl=10 2>/dev/null
 sysctl -w net.ipv4.tcp_keepalive_probes=3 2>/dev/null
 
-# --- Reutilização de portas (mais conexões simultâneas) ---
+# Reutilização de portas
 sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null
 sysctl -w net.ipv4.tcp_fin_timeout=15 2>/dev/null
 
-# --- Desabilitar slow start após idle (mantém velocidade constante) ---
-sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null
-
 echo "[OK] Tuning de rede aplicado"
-echo ""
 
 # ============================================
 # === INICIAR SERVIÇOS ===
@@ -93,15 +80,12 @@ echo ""
 echo "[OK] SSH server iniciado na porta 2222"
 
 # Iniciar sslh-select na porta 1080
-# sslh-select usa um único processo com select() - ideal para muitas conexões
-# simultâneas sem overhead de fork por conexão.
-# --transparent: tenta preservar IP de origem (best-effort)
-# -t 2: timeout de detecção de protocolo reduzido (2s em vez do padrão 5s)
-#        isso faz o SOCKS5 conectar mais rápido pois o sslh decide mais cedo
-echo "[OK] Iniciando sslh-select na porta 1080 (timeout=2s)"
+# sslh-select: um único processo lida com TODAS as conexões via select()
+# (sem fork por conexão = menos overhead para muitas conexões simultâneas)
+# O timeout padrão do sslh 1.20 já é 2s (ideal)
+echo "[OK] Iniciando sslh-select na porta 1080"
 exec /usr/sbin/sslh-select -f \
     -p 0.0.0.0:1080 \
-    -t 2 \
     --ssh 127.0.0.1:2222 \
     --socks5 127.0.0.1:9050 \
     --anyprot 127.0.0.1:9050
