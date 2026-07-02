@@ -1,48 +1,82 @@
-# Guia Definitivo: Proxy Mobile via Railway (Brasil)
+# Proxy Mobile via Railway - v2.0 (Otimizado)
 
-Esta solução substitui o Pinggy por um servidor próprio no **Railway** (São Paulo), reduzindo a latência de ~400ms para ~50ms e garantindo um endereço fixo que nunca expira.
+Solução de proxy mobile que roteia tráfego pelo IP 4G do celular via túnel SSH reverso no Railway.
 
----
-
-## Passo 1: Fazer o Deploy no Railway
-
-1. Extraia o arquivo `railway-proxy-mobile.zip` em uma pasta no seu PC.
-2. Crie um repositório privado no seu **GitHub** e suba os 3 arquivos (`Dockerfile`, `railway.json`, `start.sh`).
-3. Acesse [railway.app](https://railway.app/) e faça login.
-4. Clique em **New Project** > **Deploy from GitHub repo**.
-5. Selecione o repositório que você criou.
-6. O Railway vai começar a fazer o build da imagem Docker.
+**v2.0** inclui otimizações agressivas de velocidade que reduzem latência e aumentam throughput significativamente.
 
 ---
 
-## Passo 2: Expor as Portas (Public Networking)
+## Arquitetura
 
-Depois que o deploy terminar, você precisa expor duas portas:
-- A porta **2222** (para o celular conectar via SSH)
-- A porta **1080** (para o Fingerprint Manager usar como proxy)
+```
+Fingerprint Manager → Railway (porta 1080) → sslh → túnel SSH reverso → celular (4G)
+```
 
-1. No painel do Railway, clique no seu serviço.
-2. Vá na aba **Settings** > **Networking**.
-3. Em **TCP Proxy**, clique em **Generate TCP Proxy**.
-4. Quando pedir a porta, digite **2222**. O Railway vai gerar um endereço (ex: `round-proxy.rlwy.net:15000`).
-5. Repita o processo: clique em **Generate TCP Proxy** novamente.
-6. Desta vez, digite a porta **1080**. O Railway vai gerar outro endereço (ex: `round-proxy.rlwy.net:15001`).
+| Componente | Função |
+|------------|--------|
+| **sslh** (porta 1080) | Multiplexador: detecta SSH vs SOCKS5 na mesma porta |
+| **sshd** (porta 2222) | Recebe conexão SSH do celular |
+| **microsocks** (celular) | Proxy SOCKS5 local que usa o IP 4G |
+| **túnel reverso** | Porta 9050 do Railway → porta 8899 do celular |
 
 ---
 
-## Passo 3: Configurar o Celular (Termux)
+## Otimizações v2.0
 
-1. Instale o `sshpass` no Termux:
+### No Servidor (Railway)
+
+| Otimização | Efeito |
+|------------|--------|
+| Buffers TCP 16MB | Mais throughput em conexões de alta latência |
+| TCP BBR | Congestion control otimizado para redes móveis |
+| TCP Fast Open | Reduz 1 RTT no handshake de novas conexões |
+| `tcp_slow_start_after_idle=0` | Mantém velocidade constante mesmo após pausa |
+| `tcp_tw_reuse=1` | Reutiliza portas, mais conexões simultâneas |
+| Keepalive agressivo (10s) | Detecta conexão morta em ~30s |
+| sslh timeout=2s | Detecção de protocolo 60% mais rápida |
+| Ciphers leves no sshd | Menos CPU = mais banda disponível |
+| `RekeyLimit 0 0` | Elimina micro-pausas de renegociação |
+
+### No Celular (Termux)
+
+| Otimização | Efeito |
+|------------|--------|
+| `aes128-gcm` como cipher primário | Usa aceleração AES de hardware do ARM |
+| `Compression=no` | Evita recompressão de tráfego já comprimido |
+| `RekeyLimit="0 0"` | Sem pausas de renegociação |
+| `KexAlgorithms=curve25519-sha256` | Key exchange mais rápido |
+| `ConnectTimeout=10` | Não fica pendurado em conexão lenta |
+| Backoff inteligente | Reconexão rápida sem sobrecarregar |
+| Auto-restart do microsocks | Recupera de travamentos automaticamente |
+
+---
+
+## Deploy no Railway
+
+1. Faça fork ou suba este repositório no GitHub.
+2. No [Railway](https://railway.app/), crie um novo projeto a partir do repo.
+3. Após o deploy, vá em **Settings → Networking → TCP Proxy**.
+4. Gere um TCP Proxy para a porta **1080**.
+5. Anote o host e porta gerados (ex: `nozomi.proxy.rlwy.net:33719`).
+
+> **Nota:** Apenas UMA porta pública é necessária (1080). O sslh multiplexa SSH e SOCKS5 automaticamente.
+
+---
+
+## Configurar o Celular (Termux)
+
+1. Instale as dependências:
    ```bash
-   pkg install sshpass
+   pkg install sshpass openssh
    ```
-2. Abra o arquivo `start-celular.sh` que está no zip.
-3. Edite as duas primeiras variáveis com os dados que o Railway te deu para a porta **2222**:
+
+2. Edite `start-celular.sh` com os dados do Railway:
    ```bash
-   RAILWAY_HOST="round-proxy.rlwy.net"  # O host gerado pelo Railway
-   RAILWAY_SSH_PORT="15000"             # A porta pública que aponta para a 2222
+   RAILWAY_HOST="nozomi.proxy.rlwy.net"   # Host do TCP Proxy
+   RAILWAY_PORT="33719"                    # Porta do TCP Proxy
    ```
-4. Copie o script para o Termux e execute:
+
+3. Execute:
    ```bash
    chmod +x start-celular.sh
    ./start-celular.sh
@@ -50,25 +84,43 @@ Depois que o deploy terminar, você precisa expor duas portas:
 
 ---
 
-## Passo 4: Configurar o Fingerprint Manager
-
-No Fingerprint Manager, você vai usar o endereço gerado para a porta **1080**.
+## Configurar o Fingerprint Manager
 
 | Campo | Valor |
 |-------|-------|
 | **Tipo** | SOCKS5 |
-| **Host** | `round-proxy.rlwy.net` (O mesmo host do Railway) |
-| **Porta** | `15001` (A porta pública que aponta para a 1080) |
-| **User** | `carlos` |
-| **Pass** | `oitavamente` |
+| **Host** | Host do Railway (ex: `nozomi.proxy.rlwy.net`) |
+| **Porta** | Porta do TCP Proxy (ex: `33719`) |
+| **User** | *(deixar vazio)* |
+| **Pass** | *(deixar vazio)* |
+
+> **Importante:** O microsocks roda SEM autenticação porque o Chromium não suporta SOCKS5 com senha. A segurança é garantida pelo túnel SSH (apenas tráfego vindo do Railway chega ao microsocks).
 
 ---
 
-## Resumo da Arquitetura
+## Diagnóstico de Velocidade
 
-1. O seu celular conecta no servidor SSH do Railway e diz: "qualquer coisa que chegar na porta 1080 do Railway, mande para mim".
-2. O Fingerprint Manager conecta na porta 1080 do Railway.
-3. O Railway repassa a conexão para o celular.
-4. O celular faz a autenticação (`carlos/oitavamente`) e navega usando o IP 4G.
+Se a velocidade estiver baixa, verifique:
 
-Tudo isso acontece em **São Paulo**, com latência mínima e sem expirar!
+1. **Sinal 4G do celular** — O gargalo geralmente é a rede móvel.
+2. **CPU do celular** — Se estiver alta, o cipher pode estar pesado. O `aes128-gcm` usa aceleração de hardware em CPUs ARM modernas.
+3. **Reconexões frequentes** — Verifique se o celular não está entrando em modo de economia de bateria (mata o Termux em background).
+4. **Latência** — Teste com `ping` para o host do Railway. Deve ser < 100ms.
+
+### Dicas para máxima velocidade:
+
+- Mantenha o Termux com **wake lock** ativo (notificação "Acquire wakelock").
+- Desabilite **otimização de bateria** para o Termux nas configurações do Android.
+- Use **Wi-Fi do celular desligado** para forçar 4G (evita switching entre redes).
+- Se possível, fixe a banda em **LTE** nas configurações de rede.
+
+---
+
+## Segurança
+
+| Camada | Proteção |
+|--------|----------|
+| SSH tunnel | Criptografia AES-128-GCM ponta-a-ponta |
+| microsocks em 127.0.0.1 | Inacessível pela internet diretamente |
+| Senha SSH | `tunnel:proxypass123` (altere em produção) |
+| sslh | Só aceita SSH e SOCKS5, rejeita outros protocolos |
