@@ -17,6 +17,7 @@
 # === CONFIGURAÇÕES ===
 # Host e porta do TCP Proxy do Railway (porta interna 1080)
 RAILWAY_HOST="nozomi.proxy.rlwy.net"
+RAILWAY_IP="66.33.22.249"
 RAILWAY_PORT="33719"
 RAILWAY_USER="tunnel"
 RAILWAY_PASS="proxypass123"
@@ -48,31 +49,15 @@ pkill -f microsocks 2>/dev/null
 pkill -f "ssh.*rlwy" 2>/dev/null
 sleep 1
 
-# === CORRIGIR DNS DO TERMUX ===
+# === DNS FIX ===
 echo -e "${YELLOW}[2/4] Configurando DNS...${NC}"
+# Usar IP direto para evitar problemas de DNS no Termux
+# Se o IP mudar, resolver manualmente: ping nozomi.proxy.rlwy.net
+CONNECT_HOST="$RAILWAY_IP"
+echo -e "${GREEN}  ✓ Usando IP direto: $CONNECT_HOST${NC}"
 
-# O Termux às vezes não tem resolver DNS funcionando em [::1]:53
-# Vamos resolver o hostname para IP antes de conectar
-RAILWAY_IP=$(getent hosts "$RAILWAY_HOST" 2>/dev/null | awk '{print $1}' | head -1)
-
-if [ -z "$RAILWAY_IP" ]; then
-    # Fallback: usar dig ou nslookup ou host
-    RAILWAY_IP=$(dig +short "$RAILWAY_HOST" 2>/dev/null | head -1)
-fi
-
-if [ -z "$RAILWAY_IP" ]; then
-    # Fallback 2: usar ping para resolver
-    RAILWAY_IP=$(ping -c 1 -W 2 "$RAILWAY_HOST" 2>/dev/null | grep -oP '\(\K[0-9.]+' | head -1)
-fi
-
-if [ -z "$RAILWAY_IP" ]; then
-    echo -e "${RED}  ✗ Não conseguiu resolver DNS de $RAILWAY_HOST${NC}"
-    echo -e "${YELLOW}  Tentando conectar pelo hostname mesmo...${NC}"
-    CONNECT_HOST="$RAILWAY_HOST"
-else
-    echo -e "${GREEN}  ✓ DNS resolvido: $RAILWAY_HOST → $RAILWAY_IP${NC}"
-    CONNECT_HOST="$RAILWAY_IP"
-fi
+# Forçar Go a usar resolver DNS do sistema (não o built-in)
+export GODEBUG=netdns=cgo
 
 # === VERIFICAR/INSTALAR CHISEL ===
 echo -e "${YELLOW}[3/4] Verificando chisel...${NC}"
