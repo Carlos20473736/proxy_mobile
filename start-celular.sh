@@ -1,16 +1,17 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # =============================================
-# PROXY MOBILE v4.0 - 1 Porta, Tudo Funciona
+# PROXY MOBILE v4.1
 # =============================================
 #
-# Arquitetura:
-#   [Fingerprint Manager] → SOCKS5 → hayabusa:32618
-#        ↓ sslh detecta que NÃO é SSH
-#   encaminha para 127.0.0.1:8800 (reverse tunnel)
-#        ↓
-#   celular:8899 (microsocks)
-#        ↓
-#   internet com IP do celular
+# Fluxo:
+#   1. Microsocks roda no celular (porta 8899)
+#   2. SSH conecta ao Railway via sslh (porta 7777)
+#   3. Reverse tunnel: servidor:8899 ← celular:8899
+#   4. Fingerprint Manager conecta SOCKS5 no mesmo endereço
+#      → sslh detecta que NÃO é SSH
+#      → encaminha para 127.0.0.1:8899 (reverse tunnel)
+#      → chega no microsocks do celular
+#      → sai com IP do celular
 #
 # =============================================
 
@@ -20,7 +21,7 @@ RAILWAY_PORT="32618"
 TUNNEL_USER="tunnel"
 TUNNEL_PASS="proxypass123"
 LOCAL_SOCKS_PORT="8899"
-REMOTE_TUNNEL_PORT="8801"
+REMOTE_TUNNEL_PORT="8899"
 
 # === CORES ===
 RED='\033[0;31m'
@@ -32,7 +33,7 @@ NC='\033[0m'
 
 clear
 echo -e "${CYAN}╔═══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║  PROXY MOBILE v4.0                        ║${NC}"
+echo -e "${CYAN}║  PROXY MOBILE v4.1                        ║${NC}"
 echo -e "${CYAN}╠═══════════════════════════════════════════╣${NC}"
 echo -e "${CYAN}║  1 TCP Proxy | sslh + reverse tunnel      ║${NC}"
 echo -e "${CYAN}║  Tudo no mesmo endereço/porta             ║${NC}"
@@ -152,7 +153,7 @@ while true; do
     EXIT_CODE=$?
 
     if [ $EXIT_CODE -eq 0 ]; then
-        log "${GREEN}✓ Conexão estável encerrada${NC}"
+        log "${GREEN}✓ Conexão encerrada normalmente${NC}"
         BACKOFF=2
         ATTEMPT=0
     else
