@@ -2,52 +2,86 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Instalar apenas o necessário (sem sslh!)
+# Instalar dependências
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openssh-server \
         bash \
+        procps \
+        net-tools \
         ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Criar diretório do sshd
-RUN mkdir -p /run/sshd
+# Criar diretórios do sshd
+RUN mkdir -p /run/sshd /var/run/sshd
 
 # Configurar SSH otimizado para máxima velocidade
-# Comentar Subsystem padrão e aplicar config customizada
-RUN sed -i 's/^Subsystem/#Subsystem/' /etc/ssh/sshd_config && \
-    echo "" >> /etc/ssh/sshd_config && \
-    echo "# === PROXY MOBILE - SSH OTIMIZADO ===" >> /etc/ssh/sshd_config && \
-    echo "Port 1080" >> /etc/ssh/sshd_config && \
-    echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && \
-    echo "GatewayPorts yes" >> /etc/ssh/sshd_config && \
-    echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config && \
-    echo "ClientAliveInterval 10" >> /etc/ssh/sshd_config && \
-    echo "ClientAliveCountMax 3" >> /etc/ssh/sshd_config && \
-    echo "MaxSessions 100" >> /etc/ssh/sshd_config && \
-    echo "TCPKeepAlive yes" >> /etc/ssh/sshd_config && \
-    echo "PermitOpen any" >> /etc/ssh/sshd_config && \
-    echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config && \
-    echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config && \
-    echo "Compression no" >> /etc/ssh/sshd_config && \
-    echo "UseDNS no" >> /etc/ssh/sshd_config && \
-    echo "IPQoS throughput" >> /etc/ssh/sshd_config && \
-    echo "Ciphers aes128-gcm@openssh.com,chacha20-poly1305@openssh.com" >> /etc/ssh/sshd_config && \
-    echo "MACs hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com" >> /etc/ssh/sshd_config && \
-    echo "RekeyLimit 0 0" >> /etc/ssh/sshd_config
+RUN cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak && \
+    cat > /etc/ssh/sshd_config <<'EOF'
+# === PROXY MOBILE v3.2 - SSH OTIMIZADO ===
+Port 1080
+Protocol 2
 
-# Gerar host keys
-RUN ssh-keygen -A
+# Autenticação
+PermitRootLogin yes
+PasswordAuthentication yes
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+UsePAM yes
 
-# Criar usuário para o túnel
+# Túnel e forwarding
+GatewayPorts yes
+AllowTcpForwarding yes
+PermitOpen any
+PermitTunnel yes
+MaxSessions 100
+
+# Keep-alive (detectar desconexões rápido)
+ClientAliveInterval 15
+ClientAliveCountMax 3
+TCPKeepAlive yes
+
+# Performance
+Compression no
+UseDNS no
+IPQoS throughput
+
+# Ciphers leves (hardware-accelerated)
+Ciphers aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+MACs hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-512-etm@openssh.com
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256
+
+# Sem renegociação
+RekeyLimit 0 0
+
+# Logging
+LogLevel INFO
+
+# Banner
+PrintMotd no
+PrintLastLog no
+EOF
+
+# Gerar host keys (RSA, ECDSA, ED25519)
+RUN ssh-keygen -A && \
+    chmod 600 /etc/ssh/ssh_host_*_key && \
+    chmod 644 /etc/ssh/ssh_host_*_key.pub
+
+# Criar usuário para o túnel com shell bash
 RUN useradd -m -s /bin/bash tunnel && \
-    echo "tunnel:proxypass123" | chpasswd
+    echo "tunnel:proxypass123" | chpasswd && \
+    mkdir -p /home/tunnel/.ssh && \
+    chown -R tunnel:tunnel /home/tunnel
 
 # Script de inicialização
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
-# SSH direto na porta 1080 (sem sslh no meio!)
+# SSH direto na porta 1080
 EXPOSE 1080
+
+# Healthcheck para Railway saber que o container está vivo
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD netstat -tlnp | grep -q ':1080' || exit 1
 
 CMD ["/start.sh"]
