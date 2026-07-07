@@ -1,35 +1,31 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-# 5G-SHARE - Celular (Termux)
-# Só roda e conecta. Sem perguntas.
+# 5G-SHARE v4.0 SPEED - Celular (Termux)
+# Protocolo binário = velocidade máxima do 5G
 # ============================================================
 
-# === CONFIGURAÇÃO FIXA ===
 SERVER_HOST="hayabusa.proxy.rlwy.net"
 SERVER_PORT="32618"
 TUNNEL_SECRET="senha123"
 
-# Cores
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║       5G-SHARE - Conectando ao Railway...              ║"
+echo "║       5G-SHARE v4.0 SPEED - Velocidade Máxima          ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-# Instalar node se não tiver
 if ! command -v node &> /dev/null; then
     echo "[*] Instalando Node.js..."
     pkg install -y nodejs-lts 2>/dev/null || pkg install -y nodejs
 fi
 
-# Wake lock
 termux-wake-lock 2>/dev/null
 
-# Criar cliente de túnel
 cat > /data/data/com.termux/files/home/.5gshare-tunnel.js << 'EOF'
 const net = require('net');
 
@@ -37,22 +33,48 @@ const HOST = process.env.SH || 'hayabusa.proxy.rlwy.net';
 const PORT = parseInt(process.env.SP || '32618');
 const SECRET = process.env.SS || 'senha123';
 
+/*
+  PROTOCOLO BINÁRIO v4:
+  Header: [TYPE:1byte][ID:2bytes][LEN:4bytes][PAYLOAD:LEN bytes]
+  
+  Sem Base64, sem JSON para dados = velocidade máxima
+*/
+
+const TYPE_CONNECT = 0x01;
+const TYPE_CONNECTED = 0x02;
+const TYPE_DATA = 0x03;
+const TYPE_CLOSE = 0x04;
+const TYPE_ERROR = 0x05;
+const TYPE_PING = 0x06;
+const TYPE_PONG = 0x07;
+const HEADER_SIZE = 7;
+
 let socket = null;
-let buffer = '';
+let rawBuf = Buffer.alloc(0);
 let pingInterval = null;
 let reconnectTimer = null;
 const activeConns = new Map();
 
+function buildPacket(type, id, payload) {
+    const plen = payload ? payload.length : 0;
+    const buf = Buffer.allocUnsafe(HEADER_SIZE + plen);
+    buf[0] = type;
+    buf.writeUInt16BE(id, 1);
+    buf.writeUInt32BE(plen, 3);
+    if (payload && plen > 0) payload.copy(buf, HEADER_SIZE);
+    return buf;
+}
+
+function send(type, id, payload) {
+    if (!socket || socket.destroyed) return;
+    try { socket.write(buildPacket(type, id, payload)); } catch(e) {}
+}
+
 function connect() {
-    // Limpar estado anterior
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    buffer = '';
-
-    // Fechar conexões ativas antigas
-    for (const [id, c] of activeConns) {
-        c.destroy();
-    }
+    rawBuf = Buffer.alloc(0);
+    for (const [id, c] of activeConns) { c.destroy(); }
     activeConns.clear();
 
     console.log(`[TUNNEL] Conectando ${HOST}:${PORT}...`);
@@ -66,6 +88,12 @@ function connect() {
     socket.setNoDelay(true);
     socket.setTimeout(0);
 
+    // Aumentar buffers para velocidade
+    try {
+        socket.setRecvBufferSize && socket.setRecvBufferSize(1048576);
+        socket.setSendBufferSize && socket.setSendBufferSize(1048576);
+    } catch(e) {}
+
     let authed = false;
 
     socket.on('data', (data) => {
@@ -73,29 +101,18 @@ function connect() {
             const resp = data.toString().trim();
             if (resp === 'OK') {
                 authed = true;
-                console.log('[TUNNEL] ✅ ATIVO! PC pode usar o 5G agora.');
-                // Ping a cada 25s para manter conexão viva
-                pingInterval = setInterval(() => {
-                    if (socket && !socket.destroyed) {
-                        try {
-                            socket.write(JSON.stringify({type:'ping'}) + '\n');
-                        } catch(e) {}
-                    }
-                }, 25000);
+                console.log('[TUNNEL] ✅ ATIVO! Velocidade máxima.');
+                pingInterval = setInterval(() => { send(TYPE_PONG, 0, null); }, 25000);
             } else {
-                console.log('[TUNNEL] Auth falhou:', resp);
+                console.log('[TUNNEL] Auth falhou');
                 socket.destroy();
             }
             return;
         }
 
-        buffer += data.toString('utf8');
-        let idx;
-        while ((idx = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 1);
-            try { processMsg(JSON.parse(line)); } catch(e) {}
-        }
+        // Protocolo binário
+        rawBuf = Buffer.concat([rawBuf, data]);
+        processPackets();
     });
 
     socket.on('close', () => {
@@ -107,46 +124,57 @@ function connect() {
 
     socket.on('error', (err) => {
         console.log('[TUNNEL] Erro:', err.message);
-        // Não reconectar aqui - o 'close' event vai tratar
     });
 }
 
-function processMsg(msg) {
-    if (msg.type === 'connect') {
-        const remote = net.createConnection({ host: msg.host, port: msg.port }, () => {
-            send({ type: 'connected', id: msg.id });
-        });
-        remote.on('data', (d) => {
-            send({ type: 'data', id: msg.id, payload: d.toString('base64') });
-        });
-        remote.on('close', () => {
-            activeConns.delete(msg.id);
-            send({ type: 'close', id: msg.id });
-        });
-        remote.on('error', (e) => {
-            activeConns.delete(msg.id);
-            send({ type: 'error', id: msg.id, error: e.message });
-        });
-        remote.setTimeout(15000, () => { remote.destroy(); });
-        remote.on('connect', () => { remote.setTimeout(0); });
-        activeConns.set(msg.id, remote);
-    }
-    else if (msg.type === 'data') {
-        const c = activeConns.get(msg.id);
-        if (c && !c.destroyed) c.write(Buffer.from(msg.payload, 'base64'));
-    }
-    else if (msg.type === 'close') {
-        const c = activeConns.get(msg.id);
-        if (c) { c.destroy(); activeConns.delete(msg.id); }
-    }
-    else if (msg.type === 'pong') {}
-}
+function processPackets() {
+    while (rawBuf.length >= HEADER_SIZE) {
+        const type = rawBuf[0];
+        const id = rawBuf.readUInt16BE(1);
+        const plen = rawBuf.readUInt32BE(3);
 
-function send(obj) {
-    if (socket && !socket.destroyed) {
-        try {
-            socket.write(JSON.stringify(obj) + '\n');
-        } catch(e) {}
+        if (rawBuf.length < HEADER_SIZE + plen) break;
+
+        const payload = plen > 0 ? rawBuf.slice(HEADER_SIZE, HEADER_SIZE + plen) : null;
+        rawBuf = rawBuf.slice(HEADER_SIZE + plen);
+
+        switch (type) {
+            case TYPE_CONNECT: {
+                try {
+                    const info = JSON.parse(payload.toString());
+                    const remote = net.createConnection({ host: info.host, port: info.port }, () => {
+                        remote.setNoDelay(true);
+                        send(TYPE_CONNECTED, id, null);
+                    });
+                    remote.on('data', (d) => { send(TYPE_DATA, id, d); });
+                    remote.on('close', () => { activeConns.delete(id); send(TYPE_CLOSE, id, null); });
+                    remote.on('error', (e) => {
+                        activeConns.delete(id);
+                        send(TYPE_ERROR, id, Buffer.from(e.message));
+                    });
+                    remote.setTimeout(15000, () => { remote.destroy(); });
+                    remote.on('connect', () => { remote.setTimeout(0); });
+                    activeConns.set(id, remote);
+                } catch(e) {
+                    send(TYPE_ERROR, id, Buffer.from('parse error'));
+                }
+                break;
+            }
+            case TYPE_DATA: {
+                const c = activeConns.get(id);
+                if (c && !c.destroyed) c.write(payload);
+                break;
+            }
+            case TYPE_CLOSE: {
+                const c = activeConns.get(id);
+                if (c) { c.destroy(); activeConns.delete(id); }
+                break;
+            }
+            case TYPE_PING: {
+                send(TYPE_PONG, 0, null);
+                break;
+            }
+        }
     }
 }
 
@@ -154,14 +182,13 @@ connect();
 process.on('SIGINT', () => { console.log('\nEncerrando...'); process.exit(0); });
 process.on('uncaughtException', (err) => {
     console.log('[TUNNEL] Erro fatal:', err.message);
-    // Reconectar
     if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
     reconnectTimer = setTimeout(connect, 5000);
 });
 EOF
 
-echo -e "${GREEN}[✓] Túnel iniciado${NC}"
+echo -e "${GREEN}[✓] Túnel iniciado (protocolo binário v4)${NC}"
+echo -e "${YELLOW}    Sem Base64, sem JSON = velocidade máxima do 5G${NC}"
 echo ""
 
-# Executar
 SH="$SERVER_HOST" SP="$SERVER_PORT" SS="$TUNNEL_SECRET" node /data/data/com.termux/files/home/.5gshare-tunnel.js
