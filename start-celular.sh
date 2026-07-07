@@ -39,8 +39,8 @@ echo -e "${GREEN}  [✓] Dependências OK${NC}"
 echo -e "${YELLOW}[2/4] Detectando IPv6 do 5G...${NC}"
 
 get_ipv6() {
-    # Pegar IPv6 global (não link-local) da interface de dados móveis
-    ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6 )[\da-f:]+' | grep -v '^fe80' | head -1
+    # Pegar IPv6 público via internet (Termux sem root não mostra IPv6 local)
+    curl -s6 --max-time 5 ifconfig.me 2>/dev/null || curl -s6 --max-time 5 api6.ipify.org 2>/dev/null || curl -s6 --max-time 5 icanhazip.com 2>/dev/null
 }
 
 IPV6=$(get_ipv6)
