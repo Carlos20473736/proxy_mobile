@@ -1,12 +1,13 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  5G-SHARE v8.0 - KISS (Velocidade Máxima)                  ║
-# ║  1 controle + N conexões de dados (pipe direto)             ║
+# ║  5G-SHARE v9.0 - IPv6 DIRETO + DuckDNS                     ║
+# ║  Velocidade 100% do 5G | Zero intermediário                 ║
+# ║  Domínio fixo: carlos5g.duckdns.org                         ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-SERVER_HOST="hayabusa.proxy.rlwy.net"
-SERVER_PORT="32618"
-TUNNEL_SECRET="senha123"
+DUCKDNS_DOMAIN="carlos5g"
+DUCKDNS_TOKEN="846b54ef-f234-4a33-bed0-2fa89e55a0d8"
+PROXY_PORT="8899"
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -17,152 +18,160 @@ NC='\033[0m'
 clear
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  5G-SHARE v8.0 - Velocidade Máxima                     ║"
-echo "║  Pipe direto | Zero overhead | Zero multiplexação       ║"
+echo "║  5G-SHARE v9.0 - IPv6 Direto                           ║"
+echo "║  Velocidade 100% | Zero intermediário                   ║"
+echo "║  Domínio: ${DUCKDNS_DOMAIN}.duckdns.org:${PROXY_PORT}             ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-# Instalar Node.js se necessário
-if ! command -v node &> /dev/null; then
-    echo -e "${YELLOW}[*] Instalando Node.js...${NC}"
-    pkg install -y nodejs-lts 2>/dev/null || pkg install -y nodejs
+# === INSTALAR DEPENDÊNCIAS ===
+echo -e "${YELLOW}[1/4] Verificando dependências...${NC}"
+if ! command -v microsocks &> /dev/null; then
+    echo "  Instalando microsocks..."
+    pkg install -y microsocks 2>/dev/null
+fi
+if ! command -v curl &> /dev/null; then
+    pkg install -y curl 2>/dev/null
+fi
+echo -e "${GREEN}  [✓] Dependências OK${NC}"
+
+# === DETECTAR IPv6 ===
+echo -e "${YELLOW}[2/4] Detectando IPv6 do 5G...${NC}"
+
+get_ipv6() {
+    # Pegar IPv6 global (não link-local) da interface de dados móveis
+    ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6 )[\da-f:]+' | grep -v '^fe80' | head -1
+}
+
+IPV6=$(get_ipv6)
+
+if [ -z "$IPV6" ]; then
+    echo -e "${RED}  [✗] Nenhum IPv6 encontrado!${NC}"
+    echo "  Verifique se o 5G está ativo e tente novamente."
+    exit 1
 fi
 
+echo -e "${GREEN}  [✓] IPv6: ${IPV6}${NC}"
+
+# === ATUALIZAR DUCKDNS ===
+echo -e "${YELLOW}[3/4] Atualizando DuckDNS...${NC}"
+
+update_duckdns() {
+    local ip="$1"
+    local result=$(curl -s "https://www.duckdns.org/update?domains=${DUCKDNS_DOMAIN}&token=${DUCKDNS_TOKEN}&ipv6=${ip}")
+    if [ "$result" = "OK" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+if update_duckdns "$IPV6"; then
+    echo -e "${GREEN}  [✓] DuckDNS atualizado: ${DUCKDNS_DOMAIN}.duckdns.org → ${IPV6}${NC}"
+else
+    echo -e "${RED}  [✗] Erro ao atualizar DuckDNS${NC}"
+    echo "  Continuando com IP direto..."
+fi
+
+# === INICIAR PROXY ===
+echo -e "${YELLOW}[4/4] Iniciando proxy SOCKS5...${NC}"
+
+# Matar microsocks anterior se existir
+pkill -f microsocks 2>/dev/null
+sleep 1
+
+# Iniciar microsocks escutando em todas interfaces IPv6
+microsocks -i :: -p $PROXY_PORT &
+PROXY_PID=$!
+sleep 1
+
+if kill -0 $PROXY_PID 2>/dev/null; then
+    echo -e "${GREEN}  [✓] Proxy SOCKS5 ativo na porta ${PROXY_PORT}${NC}"
+else
+    echo -e "${RED}  [✗] Falha ao iniciar proxy${NC}"
+    exit 1
+fi
+
+# === WAKE LOCK ===
 termux-wake-lock 2>/dev/null
 
-# Criar o cliente
-cat > $HOME/.5g-v8.js << 'TUNNELEOF'
-const net = require('net');
-
-const HOST = process.env.SH;
-const PORT = parseInt(process.env.SP);
-const SECRET = process.env.SS;
-
-let control = null;
-let reconnecting = false;
-let stats = { conns: 0, active: 0 };
-
-function log(msg) { console.log(`\x1b[36m[TUNNEL]\x1b[0m ${msg}`); }
-
-function connect() {
-  if (reconnecting) return;
-  reconnecting = true;
-  
-  log(`Conectando ${HOST}:${PORT}...`);
-  
-  control = net.createConnection({ host: HOST, port: PORT }, () => {
-    control.write(`TUNNEL:${SECRET}\n`);
-  });
-  
-  control.setNoDelay(true);
-  control.setKeepAlive(true, 10000);
-  
-  let authed = false;
-  let lineBuf = '';
-  
-  control.on('data', (d) => {
-    lineBuf += d.toString();
-    
-    while (true) {
-      const nl = lineBuf.indexOf('\n');
-      if (nl === -1) break;
-      const line = lineBuf.slice(0, nl).trim();
-      lineBuf = lineBuf.slice(nl + 1);
-      
-      if (!authed) {
-        if (line === 'OK') {
-          authed = true;
-          reconnecting = false;
-          console.log(`\x1b[32m[✓] CONECTADO! PC pode usar o 5G agora.\x1b[0m`);
-        } else {
-          log('Auth falhou: ' + line);
-          control.destroy();
-        }
-        continue;
-      }
-      
-      // Processar comandos
-      if (line.startsWith('OPEN:')) {
-        handleOpen(line);
-      } else if (line === 'PING') {
-        try { control.write('PONG\n'); } catch(e) {}
-      }
-    }
-  });
-  
-  control.on('close', () => {
-    reconnecting = false;
-    log('Desconectou. Reconectando em 3s...');
-    setTimeout(connect, 3000);
-  });
-  
-  control.on('error', (e) => {
-    reconnecting = false;
-    if (e.code !== 'ECONNREFUSED') log('Erro: ' + e.message);
-    setTimeout(connect, 3000);
-  });
-}
-
-function handleOpen(line) {
-  // Formato: OPEN:<id>:<host>:<port>
-  const parts = line.split(':');
-  const id = parts[1];
-  // Host pode conter ":" (IPv6), então pegar a porta do final
-  const port = parseInt(parts[parts.length - 1]);
-  const host = parts.slice(2, -1).join(':');
-  
-  stats.conns++;
-  stats.active++;
-  
-  // Conectar ao destino
-  const remote = net.createConnection({ host, port }, () => {
-    remote.setNoDelay(true);
-    
-    // Abrir conexão de dados com o servidor
-    const data = net.createConnection({ host: HOST, port: PORT }, () => {
-      data.setNoDelay(true);
-      data.write(`DATA:${SECRET}:${id}\n`);
-      
-      // Pipe direto: servidor ↔ destino (velocidade máxima!)
-      data.pipe(remote);
-      remote.pipe(data);
-    });
-    
-    data.on('error', () => { remote.destroy(); stats.active--; });
-    data.on('close', () => { remote.destroy(); stats.active--; });
-    remote.on('error', () => data.destroy());
-    remote.on('close', () => data.destroy());
-  });
-  
-  remote.on('error', (e) => {
-    stats.active--;
-    // Abrir conexão de dados e fechar imediatamente (sinalizar erro)
-    const data = net.createConnection({ host: HOST, port: PORT }, () => {
-      data.write(`DATA:${SECRET}:${id}\n`);
-      setTimeout(() => data.destroy(), 100);
-    });
-    data.on('error', () => {});
-  });
-  
-  remote.setTimeout(10000, () => {
-    remote.destroy();
-    stats.active--;
-  });
-  remote.on('connect', () => remote.setTimeout(0));
-}
-
-// Status periódico
-setInterval(() => {
-  if (control && !control.destroyed) {
-    process.stdout.write(`\r\x1b[33m[${new Date().toLocaleTimeString()}]\x1b[0m Conexões: ${stats.conns} total | ${stats.active} ativas    `);
-  }
-}, 5000);
-
-connect();
-TUNNELEOF
-
-echo -e "${GREEN}[✓] Cliente criado${NC}"
+# === INFORMAÇÕES PARA O PC ===
+echo ""
+echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  SERVIDOR ATIVO! Configure no PC:${NC}"
+echo ""
+echo -e "  Protocolo: ${CYAN}SOCKS5${NC}"
+echo -e "  Host:      ${CYAN}${DUCKDNS_DOMAIN}.duckdns.org${NC}"
+echo -e "  Porta:     ${CYAN}${PROXY_PORT}${NC}"
+echo -e "  Usuário:   ${CYAN}(vazio)${NC}"
+echo -e "  Senha:     ${CYAN}(vazio)${NC}"
+echo ""
+echo -e "  Ou direto: ${CYAN}${IPV6}${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "${YELLOW}  Monitorando IPv6... (Ctrl+C para parar)${NC}"
 echo ""
 
-# Executar
-SH="$SERVER_HOST" SP="$SERVER_PORT" SS="$TUNNEL_SECRET" exec node $HOME/.5g-v8.js
+# === MONITOR DE IP ===
+# Verifica a cada 30s se o IPv6 mudou e atualiza o DuckDNS
+CURRENT_IP="$IPV6"
+LAST_UPDATE=$(date +%s)
+
+cleanup() {
+    echo ""
+    echo -e "${YELLOW}Encerrando...${NC}"
+    pkill -f microsocks 2>/dev/null
+    termux-wake-unlock 2>/dev/null
+    exit 0
+}
+trap cleanup INT TERM
+
+while true; do
+    sleep 30
+    
+    # Verificar se microsocks ainda está rodando
+    if ! kill -0 $PROXY_PID 2>/dev/null; then
+        echo -e "${YELLOW}[!] Proxy caiu, reiniciando...${NC}"
+        microsocks -i :: -p $PROXY_PORT &
+        PROXY_PID=$!
+        sleep 1
+    fi
+    
+    # Verificar se o IPv6 mudou
+    NEW_IP=$(get_ipv6)
+    
+    if [ -z "$NEW_IP" ]; then
+        echo -e "\r${RED}[!] IPv6 perdido - aguardando reconexão...${NC}    "
+        continue
+    fi
+    
+    if [ "$NEW_IP" != "$CURRENT_IP" ]; then
+        echo ""
+        echo -e "${YELLOW}[!] IPv6 mudou!${NC}"
+        echo -e "  Antigo: ${RED}${CURRENT_IP}${NC}"
+        echo -e "  Novo:   ${GREEN}${NEW_IP}${NC}"
+        
+        CURRENT_IP="$NEW_IP"
+        
+        # Atualizar DuckDNS
+        if update_duckdns "$NEW_IP"; then
+            echo -e "${GREEN}  [✓] DuckDNS atualizado!${NC}"
+        else
+            echo -e "${RED}  [✗] Erro ao atualizar DuckDNS${NC}"
+        fi
+        
+        # Reiniciar microsocks com novo IP
+        pkill -f microsocks 2>/dev/null
+        sleep 1
+        microsocks -i :: -p $PROXY_PORT &
+        PROXY_PID=$!
+        
+        echo -e "${GREEN}  [✓] Proxy reiniciado no novo IP${NC}"
+        echo ""
+    fi
+    
+    # Status
+    NOW=$(date +%s)
+    UPTIME=$(( (NOW - LAST_UPDATE) / 60 ))
+    printf "\r${GREEN}[✓]${NC} Online há ${UPTIME}min | IP: ${CURRENT_IP:0:20}... | Porta: ${PROXY_PORT}    "
+done
