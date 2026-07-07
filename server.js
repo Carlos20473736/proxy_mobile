@@ -82,10 +82,29 @@ function sendTunnel(cmd, id, data) {
 const server = net.createServer({ noDelay: true }, (socket) => {
     socket.setNoDelay(true);
     socket.once('data', (chunk) => {
-        if (chunk[0] === 0x05) handleSocks5(socket, chunk);
-        else if (chunk[0] === 0x43) handleHttpConnect(socket, chunk); // CONNECT
-        else if (chunk[0] === 0x47 || chunk[0] === 0x48 || chunk[0] === 0x50) handleHttp(socket, chunk);
-        else {
+        const first = chunk[0];
+        
+        if (first === 0x05) {
+            // SOCKS5
+            handleSocks5(socket, chunk);
+        } else if (first === 0x16) {
+            // TLS ClientHello - HTTPS proxy
+            // O cliente está tentando fazer TLS com o proxy
+            // Precisamos responder como proxy HTTP sem TLS
+            // Isso acontece quando configuram como "HTTPS" no app
+            // Na verdade, proxy HTTPS = HTTP CONNECT na porta 443, não TLS pro proxy
+            socket.destroy();
+        } else if (first >= 0x41 && first <= 0x5A) {
+            // Letra maiúscula ASCII = HTTP method (CONNECT, GET, POST, HEAD, PUT, etc)
+            const str = chunk.toString();
+            if (str.startsWith('CONNECT')) handleHttpConnect(socket, chunk);
+            else if (/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)/.test(str)) handleHttp(socket, chunk);
+            else {
+                const msg = str.trim();
+                if (msg === TUNNEL_SECRET) handleTunnel(socket);
+                else socket.destroy();
+            }
+        } else {
             const msg = chunk.toString().trim();
             if (msg === TUNNEL_SECRET) handleTunnel(socket);
             else socket.destroy();
@@ -229,18 +248,19 @@ function socks5Req(socket, buf) {
     routeConnection(socket, host, port, extra, 'socks5');
 }
 
-// === HTTP CONNECT ===
+// === HTTP CONNECT (usado por HTTPS proxy) ===
 function handleHttpConnect(socket, chunk) {
     const req = chunk.toString();
     const lines = req.split('\r\n');
     const m = lines[0].match(/^CONNECT\s+([^:\s]+):(\d+)\s+HTTP/i);
-    if (!m) { socket.write('HTTP/1.1 400 Bad\r\n\r\n'); socket.destroy(); return; }
+    if (!m) { socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy(); return; }
 
     if (!httpAuth(lines)) {
-        socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="5G"\r\n\r\n');
+        socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="5G-SHARE"\r\nConnection: close\r\n\r\n');
         socket.destroy(); return;
     }
 
+    console.log(`[HTTPS] CONNECT ${m[1]}:${m[2]}`);
     routeConnection(socket, m[1], parseInt(m[2]), null, 'http');
 }
 
