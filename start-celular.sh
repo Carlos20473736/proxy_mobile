@@ -44,15 +44,19 @@ echo ""
 
 # === VERIFICAR DEPENDÊNCIAS ===
 check_install() {
-    local pkg="$1"
-    if ! command -v "$pkg" &>/dev/null; then
-        log_warn "Instalando $pkg..."
-        pkg install -y "$pkg" 2>/dev/null
-        if ! command -v "$pkg" &>/dev/null; then
-            log_err "Falha ao instalar $pkg!"
+    local pkg_name="$1"   # nome do pacote (pkg install)
+    local bin_name="$2"   # nome do binário (command -v)
+    # Se não informar bin_name, usa pkg_name
+    [ -z "$bin_name" ] && bin_name="$pkg_name"
+    if ! command -v "$bin_name" &>/dev/null; then
+        log_warn "Instalando $pkg_name..."
+        pkg install -y "$pkg_name" 2>/dev/null
+        if ! command -v "$bin_name" &>/dev/null; then
+            log_err "Falha ao instalar $pkg_name (binário: $bin_name)!"
             return 1
         fi
     fi
+    log_ok "$pkg_name OK"
     return 0
 }
 
@@ -65,8 +69,8 @@ sleep 1
 
 # === VERIFICAR/INSTALAR DEPENDÊNCIAS ===
 log_info "Verificando dependências..."
-check_install "openssh" || { log_err "SSH é necessário!"; exit 1; }
-check_install "sshpass" || { log_err "sshpass é necessário!"; exit 1; }
+check_install "openssh" "ssh" || { log_err "SSH é necessário!"; exit 1; }
+check_install "sshpass" "sshpass" || { log_err "sshpass é necessário!"; exit 1; }
 
 # Microsocks - tentar pkg primeiro, senão compilar
 if ! command -v microsocks &>/dev/null; then
