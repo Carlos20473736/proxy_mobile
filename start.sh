@@ -1,63 +1,53 @@
 #!/bin/bash
-# ============================================
-# Railway Proxy Mobile v3.2 - SSH Direto
-# ============================================
-
-echo "=== Proxy Mobile v3.2 ==="
-echo "Porta 1080: SSH (celular conecta aqui)"
-echo "Porta 9050: SOCKS5 (Fingerprint Manager)"
+echo "=== Proxy Mobile v4.0 ==="
+echo "Porta 7777: sslh (SSH + SOCKS5 multiplexado)"
 echo ""
 
-# Garantir diretórios
-mkdir -p /run/sshd /var/run/sshd
+mkdir -p /run/sshd
 
-# Verificar host keys (regenerar se ausentes)
-if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
-    echo "[!] Gerando host keys..."
-    ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N "" -q
-    ssh-keygen -t ecdsa -b 256 -f /etc/ssh/ssh_host_ecdsa_key -N "" -q
-    ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q
-    chmod 600 /etc/ssh/ssh_host_*_key
-    chmod 644 /etc/ssh/ssh_host_*_key.pub
+# Regenerar keys se necessário
+[ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q
+[ -f /etc/ssh/ssh_host_rsa_key ] || ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N "" -q
+[ -f /etc/ssh/ssh_host_ecdsa_key ] || ssh-keygen -t ecdsa -b 256 -f /etc/ssh/ssh_host_ecdsa_key -N "" -q
+
+# Verificar usuário
+id tunnel &>/dev/null || { useradd -m -s /bin/bash tunnel && echo "tunnel:proxypass123" | chpasswd; }
+
+# 1) Iniciar sshd na porta 2222
+echo "[1/3] Iniciando sshd na porta 2222..."
+/usr/sbin/sshd -D -e -p 2222 &
+SSHD_PID=$!
+sleep 1
+if kill -0 $SSHD_PID 2>/dev/null; then
+    echo "  [OK] sshd rodando (PID $SSHD_PID)"
+else
+    echo "  [ERRO] sshd falhou"
+    exit 1
 fi
 
-# Verificar usuário tunnel
-if ! id tunnel &>/dev/null; then
-    useradd -m -s /bin/bash tunnel
-    echo "tunnel:proxypass123" | chpasswd
+# 2) Iniciar microsocks na porta 1080 (SOCKS5 interno)
+echo "[2/3] Iniciando microsocks na porta 1080..."
+microsocks -i 127.0.0.1 -p 1080 &
+MICRO_PID=$!
+sleep 1
+if kill -0 $MICRO_PID 2>/dev/null; then
+    echo "  [OK] microsocks rodando (PID $MICRO_PID)"
+else
+    echo "  [ERRO] microsocks falhou"
+    exit 1
 fi
 
-# Tuning de rede (ignorar erros - Railway pode não permitir)
-sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
-sysctl -w net.core.rmem_max=16777216 2>/dev/null || true
-sysctl -w net.core.wmem_max=16777216 2>/dev/null || true
-sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
-sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null || true
-sysctl -w net.ipv4.tcp_keepalive_time=10 2>/dev/null || true
-sysctl -w net.ipv4.tcp_keepalive_intvl=10 2>/dev/null || true
-sysctl -w net.ipv4.tcp_keepalive_probes=3 2>/dev/null || true
-
-# Validar sshd_config
-echo "[*] Validando sshd..."
-/usr/sbin/sshd -t
-if [ $? -ne 0 ]; then
-    echo "[ERRO] Config inválida, usando config mínima..."
-    cat > /etc/ssh/sshd_config <<'MINIMAL'
-Port 1080
-ListenAddress 0.0.0.0
-HostKey /etc/ssh/ssh_host_ed25519_key
-PermitRootLogin yes
-PasswordAuthentication yes
-GatewayPorts yes
-AllowTcpForwarding yes
-UsePAM no
-UseDNS no
-MINIMAL
-    /usr/sbin/sshd -t || { echo "[FATAL] Impossível iniciar SSH"; exit 1; }
-fi
-
-echo "[OK] Iniciando sshd na porta 1080..."
+# 3) Iniciar sslh na porta 7777 - multiplexador
+# SSH começa com "SSH-", SOCKS5 começa com 0x05
+# sslh detecta automaticamente e encaminha
+echo "[3/3] Iniciando sslh na porta 7777..."
+echo "  SSH    → 127.0.0.1:2222"
+echo "  SOCKS5 → 127.0.0.1:1080"
 echo ""
+echo "=== PRONTO! Servidor ativo na porta 7777 ==="
 
-# Iniciar sshd em foreground com log
-exec /usr/sbin/sshd -D -e -p 1080
+exec sslh --foreground \
+    --listen 0.0.0.0:7777 \
+    --ssh 127.0.0.1:2222 \
+    --anyprot 127.0.0.1:1080 \
+    --timeout 5
