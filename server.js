@@ -1,320 +1,238 @@
 const net = require('net');
 const http = require('http');
 
-// === CONFIGURAÇÃO ===
+/*
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  5G-SHARE v8.0 - KISS (Keep It Simple)                     ║
+  ║                                                             ║
+  ║  Arquitetura: 1 conexão de controle + N conexões de dados   ║
+  ║  Cada stream PC↔Celular usa 1 conexão TCP dedicada          ║
+  ║  ZERO multiplexação = ZERO bugs de protocolo                ║
+  ║  Velocidade máxima: pipe() direto sem processar dados       ║
+  ╚══════════════════════════════════════════════════════════════╝
+  
+  Fluxo:
+  1. Celular conecta e envia "TUNNEL:<secret>\n" → servidor responde "OK\n"
+  2. PC conecta com HTTP CONNECT ou SOCKS5
+  3. Servidor envia para celular via controle: "OPEN:<id>:<host>:<port>\n"
+  4. Celular abre nova conexão ao servidor: "DATA:<secret>:<id>\n"
+  5. Servidor faz pipe() entre PC socket e DATA socket
+  6. Dados fluem direto: PC ↔ Railway ↔ Celular ↔ Internet (zero overhead)
+*/
+
 const PORT = parseInt(process.env.PORT || '7777');
 const PROXY_USER = process.env.PROXY_USER || '5guser';
 const PROXY_PASS = process.env.PROXY_PASS || 'senha123';
 const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'senha123';
-const POOL_SIZE = 4;
 
-/*
-  ╔══════════════════════════════════════════════════════════════╗
-  ║  5G-SHARE v7.1 - ALTA PERFORMANCE + DEBUG                  ║
-  ║  Porta única: detecta túnel vs proxy pelo primeiro pacote   ║
-  ╚══════════════════════════════════════════════════════════════╝
-*/
-
-// === PROTOCOLO BINÁRIO ===
-const CMD = { CONNECT: 1, CONNECTED: 2, DATA: 3, CLOSE: 4, ERROR: 5, PING: 6 };
-const HDR = 5;
-const MAX_PAYLOAD = 65000;
-
-// === ESTADO ===
-const tunnelPool = [];
-let poolRR = 0;
-const pending = new Map();
-const streams = new Map();
+// Estado
+let controlSocket = null; // Conexão de controle com o celular
+const pendingStreams = new Map(); // id → { pcSocket, timeout }
+const dataWaiting = new Map(); // id → celularDataSocket (celular conectou antes do PC responder)
 let nextId = 1;
 
-function log(tag, msg) { console.log(`[${new Date().toISOString().slice(11,19)}][${tag}] ${msg}`); }
+function log(msg) { console.log(`[${new Date().toISOString().slice(11,19)}] ${msg}`); }
 
-log('INIT', `Porta: ${PORT} | User: ${PROXY_USER} | Pool: ${POOL_SIZE}`);
+log(`v8.0 KISS | Porta: ${PORT} | User: ${PROXY_USER}`);
 
-// === FRAME ===
-function frame(cmd, id, data) {
-  const len = data ? data.length : 0;
-  const buf = Buffer.allocUnsafe(HDR + len);
-  buf[0] = cmd;
-  buf.writeUInt16BE(id, 1);
-  buf.writeUInt16BE(len, 3);
-  if (data) data.copy(buf, HDR);
-  return buf;
-}
-
-function pickSocket() {
-  for (let i = 0; i < tunnelPool.length; i++) {
-    const idx = (poolRR + i) % tunnelPool.length;
-    const s = tunnelPool[idx];
-    if (s && !s.destroyed && s.writable) {
-      poolRR = (idx + 1) % tunnelPool.length;
-      return s;
-    }
-  }
-  return null;
-}
-
-function sendFrame(cmd, id, data) {
-  if (!data || data.length <= MAX_PAYLOAD) {
-    const s = pickSocket();
-    if (!s) return false;
-    return s.write(frame(cmd, id, data));
-  }
-  let off = 0;
-  while (off < data.length) {
-    const s = pickSocket();
-    if (!s) return false;
-    const chunk = data.slice(off, Math.min(off + MAX_PAYLOAD, data.length));
-    s.write(frame(cmd, id, chunk));
-    off += MAX_PAYLOAD;
-  }
-  return true;
-}
-
-function isTunnelReady() {
-  return tunnelPool.some(s => s && !s.destroyed && s.writable);
-}
-
-// === SERVIDOR PRINCIPAL ===
+// === SERVIDOR TCP ===
 const server = net.createServer({ noDelay: true }, (socket) => {
   socket.setNoDelay(true);
-  socket.setKeepAlive(true, 15000);
   
-  let firstData = true;
-  let buf = Buffer.alloc(0);
-  
-  const onFirstData = (chunk) => {
-    if (!firstData) return;
-    firstData = false;
-    socket.removeListener('data', onFirstData);
+  // Ler primeira linha para determinar tipo
+  let buf = '';
+  const onData = (chunk) => {
+    buf += chunk.toString();
+    const nl = buf.indexOf('\n');
+    if (nl === -1) return; // Esperar mais dados
     
-    buf = chunk;
-    const firstByte = chunk[0];
-    const str = chunk.toString('utf8', 0, Math.min(chunk.length, 500));
+    socket.removeListener('data', onData);
+    const firstLine = buf.slice(0, nl).trim();
+    const rest = buf.slice(nl + 1);
     
-    log('CONN', `Novo socket | byte0=0x${firstByte.toString(16)} | str="${str.slice(0,40).replace(/\n/g,'\\n')}"`);
-    
-    // Detectar tipo de conexão
-    if (str.trimEnd().startsWith(TUNNEL_SECRET)) {
-      // É um túnel do celular
-      handleTunnel(socket, str.trimEnd());
-    } else if (firstByte === 0x05) {
-      // SOCKS5
-      handleSocks5(socket, chunk);
-    } else if (str.startsWith('CONNECT ')) {
-      // HTTP CONNECT proxy
-      handleHttpConnect(socket, str);
-    } else if (/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH) /.test(str)) {
-      // HTTP proxy ou health check
-      handleHttpProxy(socket, str, chunk);
+    if (firstLine.startsWith('TUNNEL:')) {
+      handleTunnel(socket, firstLine);
+    } else if (firstLine.startsWith('DATA:')) {
+      handleDataConnection(socket, firstLine, rest);
     } else {
-      log('CONN', 'Conexão desconhecida, fechando');
-      socket.destroy();
+      // É uma conexão de PC (HTTP CONNECT, SOCKS5, ou HTTP GET)
+      // Precisa re-processar o buffer inteiro como binário
+      const fullBuf = Buffer.from(buf.slice(0, nl + 1) + rest);
+      // Na verdade, para HTTP/SOCKS5 o primeiro byte determina
+      const rawChunk = chunk;
+      // Reconstituir o buffer original
+      socket._firstBuf = Buffer.from(buf, 'binary');
+      handlePC(socket);
     }
   };
-  
-  socket.on('data', onFirstData);
+  socket.on('data', onData);
   socket.on('error', () => {});
-  socket.setTimeout(30000, () => { socket.destroy(); });
+  socket.setTimeout(15000, () => { if (!socket._identified) socket.destroy(); });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  log('OK', `Servidor ativo na porta ${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => log(`Servidor ativo na porta ${PORT}`));
 
-// === HEALTH CHECK HTTP (porta separada para Railway) ===
+// Health check
 const hServer = http.createServer((req, res) => {
   res.writeHead(200, {'Content-Type':'application/json'});
-  res.end(JSON.stringify({v:'7.1', tunnel: isTunnelReady(), pool: tunnelPool.filter(s=>s&&!s.destroyed).length, streams: streams.size}));
+  res.end(JSON.stringify({v:'8.0', tunnel: !!controlSocket && !controlSocket.destroyed, pending: pendingStreams.size}));
 });
-hServer.listen(PORT + 1, () => log('OK', `Health na porta ${PORT+1}`));
+hServer.listen(PORT + 1, () => log(`Health na porta ${PORT+1}`));
 
-// === TÚNEL ===
-function handleTunnel(socket, msg) {
-  const parts = msg.split(':');
-  // parts[0] = secret, parts[1] = poolIndex (opcional)
-  let poolIdx = 0;
-  if (parts.length >= 2) {
-    const parsed = parseInt(parts[parts.length - 1]);
-    if (!isNaN(parsed) && parsed >= 0 && parsed < POOL_SIZE) poolIdx = parsed;
+// === TÚNEL DE CONTROLE ===
+function handleTunnel(socket, line) {
+  const secret = line.slice(7); // Remove "TUNNEL:"
+  if (secret !== TUNNEL_SECRET) {
+    socket.destroy();
+    return;
   }
   
-  // Destruir slot antigo
-  if (tunnelPool[poolIdx] && !tunnelPool[poolIdx].destroyed) {
-    tunnelPool[poolIdx].removeAllListeners();
-    tunnelPool[poolIdx].destroy();
+  // Fechar controle antigo
+  if (controlSocket && !controlSocket.destroyed) {
+    controlSocket.destroy();
   }
   
-  socket.setNoDelay(true);
+  controlSocket = socket;
+  socket._identified = true;
+  socket.setTimeout(0);
   socket.setKeepAlive(true, 10000);
-  socket.setTimeout(0); // Sem timeout para túnel
-  socket._buf = Buffer.alloc(0);
-  tunnelPool[poolIdx] = socket;
-  
   socket.write('OK\n');
-  log('POOL', `Slot ${poolIdx} conectado | Total: ${tunnelPool.filter(s=>s&&!s.destroyed).length}/${POOL_SIZE}`);
+  log('Celular conectado (controle)');
   
-  // Processar frames do túnel
-  socket.on('data', (data) => {
-    socket._buf = socket._buf.length > 0 ? Buffer.concat([socket._buf, data]) : data;
-    
-    while (socket._buf.length >= HDR) {
-      const payloadLen = socket._buf.readUInt16BE(3);
-      const totalLen = HDR + payloadLen;
-      if (socket._buf.length < totalLen) break;
-      
-      const cmd = socket._buf[0];
-      const id = socket._buf.readUInt16BE(1);
-      const payload = payloadLen > 0 ? socket._buf.slice(HDR, totalLen) : null;
-      socket._buf = socket._buf.slice(totalLen);
-      
-      switch(cmd) {
-        case CMD.CONNECTED: {
-          const p = pending.get(id);
-          if (p) {
-            pending.delete(id);
-            log('STREAM', `#${id} conectado → respondendo ao PC`);
-            if (p.mode === 'socks5') {
-              p.socket.write(Buffer.from([0x05,0x00,0x00,0x01,0,0,0,0,0,0]));
-            } else {
-              p.socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-            }
-            if (p.extra && p.extra.length > 0) {
-              sendFrame(CMD.DATA, id, p.extra);
-            }
-            setupStream(id, p.socket);
-          }
-          break;
-        }
-        case CMD.DATA: {
-          const s = streams.get(id);
-          if (s && !s.socket.destroyed) {
-            s.socket.write(payload);
-          }
-          break;
-        }
-        case CMD.CLOSE: {
-          const s = streams.get(id);
-          if (s) { s.socket.end(); streams.delete(id); }
-          break;
-        }
-        case CMD.ERROR: {
-          const p = pending.get(id);
-          if (p) { pending.delete(id); p.socket.destroy(); }
-          const s = streams.get(id);
-          if (s) { s.socket.destroy(); streams.delete(id); }
-          break;
-        }
-        case CMD.PING:
-          try { socket.write(frame(CMD.PING, 0, null)); } catch(e) {}
-          break;
-      }
-    }
+  // Keepalive
+  const iv = setInterval(() => {
+    if (socket.destroyed) { clearInterval(iv); return; }
+    try { socket.write('PING\n'); } catch(e) { clearInterval(iv); }
+  }, 20000);
+  
+  socket.on('data', (d) => {
+    // Celular pode enviar PONG ou status
+    // Ignorar por enquanto
   });
   
   socket.on('close', () => {
-    if (tunnelPool[poolIdx] === socket) tunnelPool[poolIdx] = null;
-    log('POOL', `Slot ${poolIdx} desconectou | Total: ${tunnelPool.filter(s=>s&&!s.destroyed).length}/${POOL_SIZE}`);
+    if (controlSocket === socket) controlSocket = null;
+    clearInterval(iv);
+    log('Celular desconectou');
   });
   socket.on('error', () => {
-    if (tunnelPool[poolIdx] === socket) tunnelPool[poolIdx] = null;
+    if (controlSocket === socket) controlSocket = null;
+    clearInterval(iv);
   });
-  
-  // Keepalive ping
-  const iv = setInterval(() => {
-    if (socket.destroyed) { clearInterval(iv); return; }
-    try { socket.write(frame(CMD.PING, 0, null)); } catch(e) { clearInterval(iv); }
-  }, 20000);
-  socket.on('close', () => clearInterval(iv));
 }
 
-// === STREAM (PC ↔ Celular) ===
-function setupStream(id, socket) {
+// === CONEXÃO DE DADOS (celular abre para cada stream) ===
+function handleDataConnection(socket, line, rest) {
+  // Formato: "DATA:<secret>:<id>"
+  const parts = line.split(':');
+  if (parts.length < 3 || parts[1] !== TUNNEL_SECRET) {
+    socket.destroy();
+    return;
+  }
+  
+  const id = parseInt(parts[2]);
+  socket._identified = true;
   socket.setTimeout(0);
-  streams.set(id, { socket });
+  socket.setNoDelay(true);
   
-  socket.on('data', (d) => {
-    sendFrame(CMD.DATA, id, d);
-  });
+  const pending = pendingStreams.get(id);
+  if (!pending) {
+    // PC já desistiu ou ID inválido
+    socket.destroy();
+    return;
+  }
   
-  const cleanup = () => {
-    if (streams.has(id)) {
-      streams.delete(id);
-      sendFrame(CMD.CLOSE, id, null);
+  // Limpar timeout
+  clearTimeout(pending.timeout);
+  pendingStreams.delete(id);
+  
+  const pcSocket = pending.pcSocket;
+  
+  // Responder ao PC que a conexão foi estabelecida
+  if (pending.mode === 'http') {
+    pcSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+  } else if (pending.mode === 'socks5') {
+    pcSocket.write(Buffer.from([0x05,0x00,0x00,0x01,0,0,0,0,0,0]));
+  }
+  
+  // Se tinha dados extras (HTTP plain), enviar para o celular
+  if (pending.extra) {
+    socket.write(pending.extra);
+  }
+  
+  // Se rest tem dados, enviar para o PC
+  if (rest && rest.length > 0) {
+    pcSocket.write(rest);
+  }
+  
+  // PIPE DIRETO - velocidade máxima, zero overhead!
+  socket.pipe(pcSocket);
+  pcSocket.pipe(socket);
+  
+  socket.on('error', () => pcSocket.destroy());
+  pcSocket.on('error', () => socket.destroy());
+  socket.on('close', () => pcSocket.destroy());
+  pcSocket.on('close', () => socket.destroy());
+  
+  log(`Stream #${id} ativo (pipe direto)`);
+}
+
+// === CONEXÃO DO PC ===
+function handlePC(socket) {
+  socket._identified = true;
+  const raw = socket._firstBuf;
+  
+  if (!raw || raw.length === 0) {
+    socket.destroy();
+    return;
+  }
+  
+  const firstByte = raw[0];
+  
+  if (firstByte === 0x05) {
+    // SOCKS5
+    handleSocks5(socket, raw);
+  } else {
+    // HTTP
+    const str = raw.toString();
+    if (str.startsWith('CONNECT ')) {
+      handleHttpConnect(socket, str);
+    } else if (/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+http:\/\//.test(str)) {
+      handleHttpProxy(socket, str);
+    } else if (/^(GET|POST|HEAD)\s/.test(str)) {
+      // Health check direto
+      const b = JSON.stringify({v:'8.0', tunnel: !!controlSocket && !controlSocket.destroyed, pending: pendingStreams.size});
+      socket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(b)}\r\n\r\n${b}`);
+      socket.end();
+    } else {
+      socket.destroy();
     }
-  };
-  socket.on('close', cleanup);
-  socket.on('error', cleanup);
+  }
 }
 
 // === HTTP CONNECT ===
 function handleHttpConnect(socket, str) {
   const lines = str.split('\r\n');
   const m = lines[0].match(/^CONNECT\s+([^:\s]+):(\d+)\s+HTTP/i);
-  if (!m) {
-    log('HTTP', 'CONNECT inválido: ' + lines[0]);
-    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-    socket.destroy();
-    return;
-  }
+  if (!m) { socket.write('HTTP/1.1 400 Bad\r\n\r\n'); socket.destroy(); return; }
   
   if (!checkAuth(lines)) {
-    log('HTTP', 'Auth falhou para CONNECT ' + m[1]);
-    socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="5G-SHARE"\r\n\r\n');
-    socket.destroy();
-    return;
+    socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="5G"\r\n\r\n');
+    socket.destroy(); return;
   }
   
-  const host = m[1], port = parseInt(m[2]);
-  log('HTTP', `CONNECT ${host}:${port} | tunnel=${isTunnelReady()}`);
-  
-  if (!isTunnelReady()) {
-    socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-  
-  const id = nextId++;
-  if (nextId > 65534) nextId = 1;
-  
-  sendFrame(CMD.CONNECT, id, Buffer.from(`${host}:${port}`));
-  pending.set(id, { socket, mode: 'http', extra: null, ts: Date.now() });
-  log('STREAM', `#${id} pendente → ${host}:${port}`);
-  
-  // Timeout
-  setTimeout(() => {
-    if (pending.has(id)) {
-      log('STREAM', `#${id} TIMEOUT`);
-      pending.delete(id);
-      socket.write('HTTP/1.1 504 Gateway Timeout\r\n\r\n');
-      socket.destroy();
-    }
-  }, 10000);
+  routeToTunnel(socket, m[1], parseInt(m[2]), null, 'http');
 }
 
 // === HTTP PROXY (GET/POST direto) ===
-function handleHttpProxy(socket, str, chunk) {
+function handleHttpProxy(socket, str) {
   const lines = str.split('\r\n');
   const pm = lines[0].match(/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+http:\/\/([^\/:\s]+)(?::(\d+))?(\/\S*)\s+HTTP/i);
-  
-  if (!pm) {
-    // Health check
-    const b = JSON.stringify({status:'online', tunnel: isTunnelReady(), pool: tunnelPool.filter(s=>s&&!s.destroyed).length});
-    socket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(b)}\r\n\r\n${b}`);
-    socket.end();
-    return;
-  }
+  if (!pm) { socket.destroy(); return; }
   
   if (!checkAuth(lines)) {
-    socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="5G-SHARE"\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-  
-  if (!isTunnelReady()) {
-    socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-    socket.destroy();
-    return;
+    socket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="5G"\r\n\r\n');
+    socket.destroy(); return;
   }
   
   const host = pm[2], port = parseInt(pm[3]||'80'), path = pm[4];
@@ -322,95 +240,76 @@ function handleHttpProxy(socket, str, chunk) {
   const filtered = lines.filter(l => !/^Proxy-Auth/i.test(l));
   const extra = Buffer.from(filtered.join('\r\n'));
   
-  const id = nextId++;
-  if (nextId > 65534) nextId = 1;
-  
-  sendFrame(CMD.CONNECT, id, Buffer.from(`${host}:${port}`));
-  pending.set(id, { socket, mode: 'http-plain', extra, ts: Date.now() });
-  
-  setTimeout(() => {
-    if (pending.has(id)) {
-      pending.delete(id);
-      socket.write('HTTP/1.1 504 Gateway Timeout\r\n\r\n');
-      socket.destroy();
-    }
-  }, 10000);
+  routeToTunnel(socket, host, port, extra, 'http-plain');
 }
 
 // === SOCKS5 ===
 function handleSocks5(socket, chunk) {
   socket.setTimeout(0);
-  const nm = chunk[1];
-  socket.write(Buffer.from([0x05, 0x02])); // requer user/pass auth
+  socket.write(Buffer.from([0x05, 0x02])); // requer auth
   
-  let remaining = chunk.slice(2 + nm);
-  if (remaining.length > 0) socks5Auth(socket, remaining);
-  else socket.once('data', (d) => socks5Auth(socket, d));
-}
-
-function socks5Auth(socket, buf) {
-  if (buf.length < 3) { socket.destroy(); return; }
-  const ulen = buf[1];
-  if (buf.length < 2 + ulen + 1) { socket.destroy(); return; }
-  const user = buf.slice(2, 2+ulen).toString();
-  const plen = buf[2+ulen];
-  if (buf.length < 3 + ulen + plen) { socket.destroy(); return; }
-  const pass = buf.slice(3+ulen, 3+ulen+plen).toString();
-  
-  if (user !== PROXY_USER || pass !== PROXY_PASS) {
-    socket.write(Buffer.from([0x01,0x01]));
-    socket.destroy();
-    return;
-  }
-  socket.write(Buffer.from([0x01,0x00])); // auth OK
-  
-  let rest = buf.slice(3+ulen+plen);
-  if (rest.length > 0) socks5Req(socket, rest);
-  else socket.once('data', (d) => socks5Req(socket, d));
-}
-
-function socks5Req(socket, buf) {
-  if (buf.length < 4) { socket.destroy(); return; }
-  const atyp = buf[3];
-  let host, port, end;
-  
-  if (atyp === 1) { // IPv4
-    if (buf.length < 10) { socket.destroy(); return; }
-    host = `${buf[4]}.${buf[5]}.${buf[6]}.${buf[7]}`;
-    port = buf.readUInt16BE(8); end = 10;
-  } else if (atyp === 3) { // Domain
-    const dl = buf[4];
-    if (buf.length < 5+dl+2) { socket.destroy(); return; }
-    host = buf.slice(5, 5+dl).toString();
-    port = buf.readUInt16BE(5+dl); end = 7+dl;
-  } else if (atyp === 4) { // IPv6
-    if (buf.length < 22) { socket.destroy(); return; }
-    const p = []; for(let i=0;i<16;i+=2) p.push(buf.readUInt16BE(4+i).toString(16));
-    host = p.join(':'); port = buf.readUInt16BE(20); end = 22;
-  } else { socket.destroy(); return; }
-  
-  log('SOCKS5', `CONNECT ${host}:${port} | tunnel=${isTunnelReady()}`);
-  
-  if (!isTunnelReady()) {
-    socket.write(Buffer.from([0x05,0x05,0x00,0x01,0,0,0,0,0,0]));
-    socket.destroy();
-    return;
-  }
-  
-  const extra = end < buf.length ? buf.slice(end) : null;
-  const id = nextId++;
-  if (nextId > 65534) nextId = 1;
-  
-  sendFrame(CMD.CONNECT, id, Buffer.from(`${host}:${port}`));
-  pending.set(id, { socket, mode: 'socks5', extra, ts: Date.now() });
-  
-  setTimeout(() => {
-    if (pending.has(id)) {
-      pending.delete(id);
-      socket.write(Buffer.from([0x05,0x05,0x00,0x01,0,0,0,0,0,0]));
-      socket.destroy();
+  socket.once('data', (d) => {
+    // Auth
+    if (d.length < 3) { socket.destroy(); return; }
+    const ulen = d[1];
+    const user = d.slice(2, 2+ulen).toString();
+    const plen = d[2+ulen];
+    const pass = d.slice(3+ulen, 3+ulen+plen).toString();
+    
+    if (user !== PROXY_USER || pass !== PROXY_PASS) {
+      socket.write(Buffer.from([0x01,0x01])); socket.destroy(); return;
     }
-  }, 10000);
+    socket.write(Buffer.from([0x01,0x00]));
+    
+    socket.once('data', (req) => {
+      if (req.length < 4) { socket.destroy(); return; }
+      const atyp = req[3];
+      let host, port;
+      
+      if (atyp === 1) {
+        host = `${req[4]}.${req[5]}.${req[6]}.${req[7]}`;
+        port = req.readUInt16BE(8);
+      } else if (atyp === 3) {
+        const dl = req[4];
+        host = req.slice(5, 5+dl).toString();
+        port = req.readUInt16BE(5+dl);
+      } else if (atyp === 4) {
+        const p = []; for(let i=0;i<16;i+=2) p.push(req.readUInt16BE(4+i).toString(16));
+        host = p.join(':'); port = req.readUInt16BE(20);
+      } else { socket.destroy(); return; }
+      
+      routeToTunnel(socket, host, port, null, 'socks5');
+    });
+  });
+}
+
+// === ROTEAR PARA O TÚNEL ===
+function routeToTunnel(pcSocket, host, port, extra, mode) {
+  if (!controlSocket || controlSocket.destroyed) {
+    if (mode === 'http' || mode === 'http-plain') pcSocket.write('HTTP/1.1 502 Tunnel Offline\r\n\r\n');
+    else if (mode === 'socks5') pcSocket.write(Buffer.from([0x05,0x05,0x00,0x01,0,0,0,0,0,0]));
+    pcSocket.destroy();
+    return;
+  }
+  
+  const id = nextId++;
+  if (nextId > 999999) nextId = 1;
+  
+  // Guardar PC socket pendente
+  const timeout = setTimeout(() => {
+    if (pendingStreams.has(id)) {
+      pendingStreams.delete(id);
+      if (mode === 'http' || mode === 'http-plain') pcSocket.write('HTTP/1.1 504 Timeout\r\n\r\n');
+      else if (mode === 'socks5') pcSocket.write(Buffer.from([0x05,0x05,0x00,0x01,0,0,0,0,0,0]));
+      pcSocket.destroy();
+    }
+  }, 15000);
+  
+  pendingStreams.set(id, { pcSocket, mode, extra, timeout });
+  
+  // Pedir ao celular para abrir conexão
+  controlSocket.write(`OPEN:${id}:${host}:${port}\n`);
+  log(`Stream #${id} → ${host}:${port}`);
 }
 
 // === AUTH ===
@@ -427,16 +326,14 @@ function checkAuth(lines) {
   return false;
 }
 
-// === LIMPEZA ===
+// Limpeza
 setInterval(() => {
-  const now = Date.now();
-  for (const [id, p] of pending) {
-    if (now - p.ts > 15000) {
-      pending.delete(id);
-      try { p.socket.destroy(); } catch(e) {}
+  for (const [id, p] of pendingStreams) {
+    if (p.pcSocket.destroyed) {
+      clearTimeout(p.timeout);
+      pendingStreams.delete(id);
     }
   }
-}, 10000);
+}, 30000);
 
-process.on('uncaughtException', (e) => log('ERR', e.message));
-process.on('SIGTERM', () => { log('EXIT', 'Encerrando'); process.exit(0); });
+process.on('uncaughtException', (e) => log('ERR: ' + e.message));
