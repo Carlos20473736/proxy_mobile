@@ -6,7 +6,6 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openssh-server \
         sslh \
-        microsocks \
         procps && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /run/sshd

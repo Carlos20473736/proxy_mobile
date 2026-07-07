@@ -4,16 +4,13 @@
 # =============================================
 #
 # Arquitetura:
-#   Railway roda sslh na porta 7777 que detecta:
-#   - Conexão SSH → encaminha pro sshd (celular)
-#   - Conexão SOCKS5 → encaminha pro microsocks
-#
-#   O celular conecta via SSH e cria um túnel
-#   reverso. O microsocks no servidor usa esse
-#   túnel para rotear o tráfego pelo celular.
-#
-#   Fingerprint Manager conecta SOCKS5 direto
-#   no mesmo endereço (sslh detecta e encaminha).
+#   [Fingerprint Manager] → SOCKS5 → hayabusa:32618
+#        ↓ sslh detecta que NÃO é SSH
+#   encaminha para 127.0.0.1:8800 (reverse tunnel)
+#        ↓
+#   celular:8899 (microsocks)
+#        ↓
+#   internet com IP do celular
 #
 # =============================================
 
@@ -23,6 +20,7 @@ RAILWAY_PORT="32618"
 TUNNEL_USER="tunnel"
 TUNNEL_PASS="proxypass123"
 LOCAL_SOCKS_PORT="8899"
+REMOTE_TUNNEL_PORT="8800"
 
 # === CORES ===
 RED='\033[0;31m'
@@ -34,19 +32,28 @@ NC='\033[0m'
 
 clear
 echo -e "${CYAN}╔═══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║  PROXY MOBILE v4.0 - 1 Porta             ║${NC}"
+echo -e "${CYAN}║  PROXY MOBILE v4.0                        ║${NC}"
 echo -e "${CYAN}╠═══════════════════════════════════════════╣${NC}"
-echo -e "${CYAN}║  sslh multiplexador: SSH + SOCKS5         ║${NC}"
-echo -e "${CYAN}║  Tudo no mesmo endereço                   ║${NC}"
+echo -e "${CYAN}║  1 TCP Proxy | sslh + reverse tunnel      ║${NC}"
+echo -e "${CYAN}║  Tudo no mesmo endereço/porta             ║${NC}"
 echo -e "${CYAN}╚═══════════════════════════════════════════╝${NC}"
 echo ""
 
-# === MATAR PROCESSOS ANTERIORES ===
+# === FUNÇÕES ===
 log() { echo -e "[$(date '+%H:%M:%S')] $1"; }
 
+cleanup() {
+    echo ""
+    log "${YELLOW}Encerrando...${NC}"
+    pkill -f microsocks 2>/dev/null
+    pkill -f "ssh.*${RAILWAY_HOST}" 2>/dev/null
+    exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# === MATAR PROCESSOS ANTERIORES ===
 log "${YELLOW}Limpando processos anteriores...${NC}"
 pkill -f microsocks 2>/dev/null
-pkill -f "ssh.*${RAILWAY_HOST}" 2>/dev/null
 pkill -f "ssh.*rlwy" 2>/dev/null
 sleep 1
 
@@ -56,7 +63,6 @@ for pkg_bin in "openssh:ssh" "sshpass:sshpass"; do
     pkg_name="${pkg_bin%%:*}"
     bin_name="${pkg_bin##*:}"
     if ! command -v "$bin_name" &>/dev/null; then
-        echo -e "  ${YELLOW}Instalando $pkg_name...${NC}"
         pkg install -y "$pkg_name" 2>/dev/null
     fi
     if command -v "$bin_name" &>/dev/null; then
@@ -66,9 +72,7 @@ for pkg_bin in "openssh:ssh" "sshpass:sshpass"; do
     fi
 done
 
-# Microsocks
 if ! command -v microsocks &>/dev/null; then
-    echo -e "  ${YELLOW}Instalando microsocks...${NC}"
     pkg install -y microsocks 2>/dev/null || {
         pkg install -y git make clang 2>/dev/null
         rm -rf /tmp/microsocks
@@ -91,19 +95,18 @@ else
 fi
 
 # === TESTAR CONECTIVIDADE ===
-log "${YELLOW}Testando conectividade com Railway...${NC}"
+log "${YELLOW}Testando conectividade...${NC}"
 if timeout 5 bash -c "echo >/dev/tcp/${RAILWAY_HOST}/${RAILWAY_PORT}" 2>/dev/null; then
     echo -e "  ${GREEN}✓ Railway acessível${NC}"
 else
-    echo -e "  ${RED}✗ Railway inacessível (${RAILWAY_HOST}:${RAILWAY_PORT})${NC}"
-    echo -e "  ${YELLOW}Tentando mesmo assim...${NC}"
+    echo -e "  ${YELLOW}⚠ Não foi possível testar, tentando mesmo assim...${NC}"
 fi
 
 # === INFO ===
 echo ""
 echo -e "${CYAN}Configuração:${NC}"
-echo -e "  Servidor: ${RAILWAY_HOST}:${RAILWAY_PORT}"
-echo -e "  Túnel:    servidor:8899 ← celular:${LOCAL_SOCKS_PORT}"
+echo -e "  Servidor:  ${RAILWAY_HOST}:${RAILWAY_PORT}"
+echo -e "  Túnel:     servidor:${REMOTE_TUNNEL_PORT} ← celular:${LOCAL_SOCKS_PORT}"
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════${NC}"
 echo -e "${BOLD}Fingerprint Manager:${NC}"
@@ -113,16 +116,6 @@ echo -e "  Porta:     ${RAILWAY_PORT}"
 echo -e "  User/Pass: (vazio)"
 echo -e "${GREEN}═══════════════════════════════════════════${NC}"
 echo ""
-
-# === CLEANUP ===
-cleanup() {
-    echo ""
-    log "${YELLOW}Encerrando...${NC}"
-    pkill -f microsocks 2>/dev/null
-    pkill -f "ssh.*${RAILWAY_HOST}" 2>/dev/null
-    exit 0
-}
-trap cleanup SIGINT SIGTERM
 
 # === LOOP DE RECONEXÃO ===
 ATTEMPT=0
@@ -152,14 +145,14 @@ while true; do
         -o TCPKeepAlive=yes \
         -o Compression=no \
         -o LogLevel=ERROR \
-        -R 0.0.0.0:8899:127.0.0.1:${LOCAL_SOCKS_PORT} \
+        -R 0.0.0.0:${REMOTE_TUNNEL_PORT}:127.0.0.1:${LOCAL_SOCKS_PORT} \
         -p "$RAILWAY_PORT" \
         "${TUNNEL_USER}@${RAILWAY_HOST}" 2>&1
 
     EXIT_CODE=$?
 
     if [ $EXIT_CODE -eq 0 ]; then
-        log "${YELLOW}Conexão encerrada normalmente${NC}"
+        log "${GREEN}✓ Conexão estável encerrada${NC}"
         BACKOFF=2
         ATTEMPT=0
     else
