@@ -1,291 +1,138 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-# 5G-SHARE - Script do Celular (Termux)
-# Conecta ao servidor Railway e roteia internet pelo 5G
+# 5G-SHARE - Celular (Termux)
+# Só roda e conecta. Sem perguntas.
 # ============================================================
 
-set -e
-
-# === CONFIGURAÇÃO ===
-# Coloque aqui o endereço do seu servidor Railway
-SERVER_HOST="${SERVER_HOST:-SEU_APP.railway.app}"
-SERVER_PORT="${SERVER_PORT:-443}"
-TUNNEL_SECRET="${TUNNEL_SECRET:-tunnel_secret_key}"
+# === CONFIGURAÇÃO FIXA ===
+SERVER_HOST="hayabusa.proxy.rlwy.net"
+SERVER_PORT="32618"
+TUNNEL_SECRET="senha123"
 
 # Cores
-RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-CONFIG_FILE="$HOME/.5gshare/config-railway.sh"
+echo -e "${CYAN}"
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║       5G-SHARE - Conectando ao Railway...              ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
 
-mostrar_banner() {
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║       5G-SHARE - Celular → Railway (Túnel)             ║"
-    echo "║   Compartilhando internet 5G com seu PC                ║"
-    echo "╚══════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-}
+# Instalar node se não tiver
+if ! command -v node &> /dev/null; then
+    echo "[*] Instalando Node.js..."
+    pkg install -y nodejs-lts 2>/dev/null || pkg install -y nodejs
+fi
 
-instalar_dependencias() {
-    echo -e "${BLUE}[1/3] Verificando dependências...${NC}"
-    
-    # Verificar se node está instalado
-    if ! command -v node &> /dev/null; then
-        echo "  Instalando Node.js..."
-        pkg install -y nodejs-lts 2>/dev/null || pkg install -y nodejs
-    fi
-    
-    echo -e "${GREEN}  ✅ Dependências OK${NC}"
-}
+# Wake lock
+termux-wake-lock 2>/dev/null
 
-carregar_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        echo -e "${GREEN}[✓] Config carregada: $SERVER_HOST:$SERVER_PORT${NC}"
-        echo ""
-        echo -n "Usar esta configuração? (s/n): "
-        read -r usar
-        if [ "$usar" != "s" ] && [ "$usar" != "S" ] && [ "$usar" != "" ]; then
-            solicitar_config
-        fi
-    else
-        solicitar_config
-    fi
-}
-
-solicitar_config() {
-    echo ""
-    echo -e "${YELLOW}Configure a conexão com o Railway:${NC}"
-    echo ""
-    echo -n "  Host do Railway (ex: seu-app.railway.app): "
-    read -r SERVER_HOST
-    echo -n "  Porta (padrão 443): "
-    read -r input_port
-    SERVER_PORT="${input_port:-443}"
-    echo -n "  Tunnel Secret (padrão: tunnel_secret_key): "
-    read -r input_secret
-    TUNNEL_SECRET="${input_secret:-tunnel_secret_key}"
-    
-    # Salvar
-    mkdir -p "$HOME/.5gshare"
-    cat > "$CONFIG_FILE" << EOF
-SERVER_HOST="$SERVER_HOST"
-SERVER_PORT="$SERVER_PORT"
-TUNNEL_SECRET="$TUNNEL_SECRET"
-EOF
-    echo -e "${GREEN}  ✅ Configuração salva${NC}"
-}
-
-# === CLIENTE DE TÚNEL (Node.js) ===
-criar_cliente_tunnel() {
-    mkdir -p "$HOME/.5gshare"
-    cat > "$HOME/.5gshare/tunnel-client.js" << 'NODEJS_EOF'
+# Criar cliente de túnel
+cat > /data/data/com.termux/files/home/.5gshare-tunnel.js << 'EOF'
 const net = require('net');
 
-const SERVER_HOST = process.env.SERVER_HOST;
-const SERVER_PORT = parseInt(process.env.SERVER_PORT || '443');
-const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'tunnel_secret_key';
+const HOST = process.env.SH || 'hayabusa.proxy.rlwy.net';
+const PORT = parseInt(process.env.SP || '32618');
+const SECRET = process.env.SS || 'senha123';
 
 let socket = null;
-let reconnectTimer = null;
 let buffer = '';
+const activeConns = new Map();
 
 function connect() {
-    console.log(`[TUNNEL] Conectando a ${SERVER_HOST}:${SERVER_PORT}...`);
-    
-    socket = net.createConnection({ host: SERVER_HOST, port: SERVER_PORT }, () => {
+    console.log(`[TUNNEL] Conectando ${HOST}:${PORT}...`);
+
+    socket = net.createConnection({ host: HOST, port: PORT }, () => {
         console.log('[TUNNEL] Conectado! Autenticando...');
-        socket.write(TUNNEL_SECRET + '\n');
+        socket.write(SECRET + '\n');
     });
-    
+
     socket.setKeepAlive(true, 15000);
+    socket.setNoDelay(true);
     socket.setTimeout(0);
-    
-    let authenticated = false;
-    
+
+    let authed = false;
+
     socket.on('data', (data) => {
-        if (!authenticated) {
-            const msg = data.toString('utf8').trim();
-            if (msg === 'OK') {
-                authenticated = true;
-                console.log('[TUNNEL] Autenticado! Túnel ativo.');
-                console.log('[TUNNEL] Seu PC agora pode usar a internet do seu 5G!');
-                console.log('');
-                // Iniciar keepalive
-                startKeepalive();
+        if (!authed) {
+            if (data.toString().trim() === 'OK') {
+                authed = true;
+                console.log('[TUNNEL] ✅ ATIVO! PC pode usar o 5G agora.');
+                setInterval(() => {
+                    if (socket && !socket.destroyed) {
+                        socket.write(JSON.stringify({type:'ping'}) + '\n');
+                    }
+                }, 20000);
             } else {
-                console.log('[TUNNEL] Autenticação falhou:', msg);
+                console.log('[TUNNEL] Auth falhou');
                 socket.destroy();
             }
             return;
         }
-        
-        // Processar comandos do servidor
+
         buffer += data.toString('utf8');
-        let newlineIndex;
-        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, newlineIndex);
-            buffer = buffer.slice(newlineIndex + 1);
-            processCommand(line);
+        let idx;
+        while ((idx = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 1);
+            try { processMsg(JSON.parse(line)); } catch(e) {}
         }
     });
-    
+
     socket.on('close', () => {
-        console.log('[TUNNEL] Conexão fechada. Reconectando em 5s...');
-        authenticated = false;
-        scheduleReconnect();
+        console.log('[TUNNEL] Desconectou. Reconectando em 3s...');
+        authed = false;
+        setTimeout(connect, 3000);
     });
-    
+
     socket.on('error', (err) => {
         console.log('[TUNNEL] Erro:', err.message);
-        scheduleReconnect();
     });
 }
 
-function scheduleReconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(() => {
-        connect();
-    }, 5000);
-}
-
-// Conexões ativas para o celular
-const activeConnections = new Map();
-
-function processCommand(line) {
-    try {
-        const msg = JSON.parse(line);
-        
-        if (msg.type === 'connect') {
-            // Servidor pede para conectar a um host
-            handleConnect(msg.id, msg.host, msg.port);
-        }
-        else if (msg.type === 'data') {
-            // Dados para uma conexão ativa
-            const conn = activeConnections.get(msg.id);
-            if (conn) {
-                const decoded = Buffer.from(msg.payload, 'base64');
-                conn.write(decoded);
-            }
-        }
-        else if (msg.type === 'close') {
-            // Fechar uma conexão
-            const conn = activeConnections.get(msg.id);
-            if (conn) {
-                conn.destroy();
-                activeConnections.delete(msg.id);
-            }
-        }
-        else if (msg.type === 'pong') {
-            // Resposta do keepalive
-        }
-    } catch (err) {
-        // Ignorar linhas inválidas
-    }
-}
-
-function handleConnect(id, host, port) {
-    console.log(`[CONN ${id}] Conectando: ${host}:${port}`);
-    
-    const remote = net.createConnection({ host, port }, () => {
-        console.log(`[CONN ${id}] Conectado!`);
-        // Informar servidor que conectou
-        sendToServer({ type: 'connected', id });
-    });
-    
-    remote.on('data', (data) => {
-        // Enviar dados de volta para o servidor
-        sendToServer({
-            type: 'data',
-            id,
-            payload: data.toString('base64')
+function processMsg(msg) {
+    if (msg.type === 'connect') {
+        const remote = net.createConnection({ host: msg.host, port: msg.port }, () => {
+            send({ type: 'connected', id: msg.id });
         });
-    });
-    
-    remote.on('close', () => {
-        activeConnections.delete(id);
-        sendToServer({ type: 'close', id });
-    });
-    
-    remote.on('error', (err) => {
-        console.log(`[CONN ${id}] Erro: ${err.message}`);
-        activeConnections.delete(id);
-        sendToServer({ type: 'error', id, error: err.message });
-    });
-    
-    // Timeout de conexão
-    remote.setTimeout(15000, () => {
-        console.log(`[CONN ${id}] Timeout`);
-        remote.destroy();
-        sendToServer({ type: 'error', id, error: 'timeout' });
-    });
-    
-    // Após conectar, remover timeout
-    remote.on('connect', () => {
-        remote.setTimeout(0);
-    });
-    
-    activeConnections.set(id, remote);
-}
-
-function sendToServer(msg) {
-    if (socket && !socket.destroyed) {
-        socket.write(JSON.stringify(msg) + '\n');
+        remote.on('data', (d) => {
+            send({ type: 'data', id: msg.id, payload: d.toString('base64') });
+        });
+        remote.on('close', () => {
+            activeConns.delete(msg.id);
+            send({ type: 'close', id: msg.id });
+        });
+        remote.on('error', (e) => {
+            activeConns.delete(msg.id);
+            send({ type: 'error', id: msg.id, error: e.message });
+        });
+        remote.setTimeout(15000, () => { remote.destroy(); });
+        remote.on('connect', () => { remote.setTimeout(0); });
+        activeConns.set(msg.id, remote);
     }
+    else if (msg.type === 'data') {
+        const c = activeConns.get(msg.id);
+        if (c && !c.destroyed) c.write(Buffer.from(msg.payload, 'base64'));
+    }
+    else if (msg.type === 'close') {
+        const c = activeConns.get(msg.id);
+        if (c) { c.destroy(); activeConns.delete(msg.id); }
+    }
+    else if (msg.type === 'pong') {}
 }
 
-function startKeepalive() {
-    setInterval(() => {
-        sendToServer({ type: 'ping' });
-    }, 25000);
+function send(obj) {
+    if (socket && !socket.destroyed) socket.write(JSON.stringify(obj) + '\n');
 }
 
-// Iniciar
 connect();
+process.on('SIGINT', () => { console.log('\nEncerrando...'); process.exit(0); });
+EOF
 
-// Manter processo vivo
-process.on('SIGINT', () => {
-    console.log('\n[TUNNEL] Encerrando...');
-    if (socket) socket.destroy();
-    process.exit(0);
-});
+echo -e "${GREEN}[✓] Túnel iniciado${NC}"
+echo ""
 
-process.on('uncaughtException', (err) => {
-    console.log('[TUNNEL] Erro não tratado:', err.message);
-    scheduleReconnect();
-});
-NODEJS_EOF
-}
-
-iniciar_tunnel() {
-    echo -e "${BLUE}[2/3] Criando cliente de túnel...${NC}"
-    criar_cliente_tunnel
-    
-    echo -e "${BLUE}[3/3] Conectando ao Railway...${NC}"
-    echo ""
-    
-    # Adquirir wake lock
-    termux-wake-lock 2>/dev/null || true
-    
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  TÚNEL ATIVO - Pressione Ctrl+C para parar${NC}"
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    
-    # Executar o cliente Node.js
-    SERVER_HOST="$SERVER_HOST" \
-    SERVER_PORT="$SERVER_PORT" \
-    TUNNEL_SECRET="$TUNNEL_SECRET" \
-    node "$HOME/.5gshare/tunnel-client.js"
-}
-
-# === EXECUÇÃO ===
-mostrar_banner
-instalar_dependencias
-carregar_config
-iniciar_tunnel
+# Executar
+SH="$SERVER_HOST" SP="$SERVER_PORT" SS="$TUNNEL_SECRET" node /data/data/com.termux/files/home/.5gshare-tunnel.js

@@ -1,281 +1,287 @@
 const net = require('net');
-const crypto = require('crypto');
+const http = require('http');
 
-// === CONFIGURAÇÃO (via variáveis de ambiente) ===
-const PROXY_PORT = parseInt(process.env.PORT || '1080');
+// === CONFIGURAÇÃO ===
+const TCP_PORT = 7777; // Porta TCP pública (Railway TCP Proxy)
+const HTTP_PORT = parseInt(process.env.PORT || '3000'); // Porta HTTP (health check)
 const PROXY_USER = process.env.PROXY_USER || '5guser';
 const PROXY_PASS = process.env.PROXY_PASS || 'senha123';
-const SSH_PORT = parseInt(process.env.SSH_PORT || '2222');
-const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'tunnel_secret_key';
+const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'senha123';
 
-// Armazena a conexão do túnel do celular
+// Conexão do celular
 let tunnelSocket = null;
-let pendingConnections = new Map();
+let tunnelAuthenticated = false;
+let tunnelBuffer = '';
+const pendingConnections = new Map();
+const activePipes = new Map();
 let connectionId = 0;
 
 console.log('=== 5G-SHARE - Servidor Railway ===');
-console.log(`Proxy SOCKS5 na porta: ${PROXY_PORT}`);
-console.log(`Túnel na porta: ${SSH_PORT}`);
+console.log(`TCP (SOCKS5 + Túnel): porta ${TCP_PORT}`);
+console.log(`HTTP (health check): porta ${HTTP_PORT}`);
 console.log(`Usuário: ${PROXY_USER}`);
+console.log(`Público: hayabusa.proxy.rlwy.net:32618`);
 console.log('===================================');
 
-// === SERVIDOR DE TÚNEL (recebe conexão do Termux) ===
-const tunnelServer = net.createServer((socket) => {
-    console.log('[TUNNEL] Nova conexão do celular...');
-    
-    let authenticated = false;
-    let buffer = Buffer.alloc(0);
-    
-    socket.on('data', (data) => {
-        if (!authenticated) {
-            buffer = Buffer.concat([buffer, data]);
-            // Protocolo simples de autenticação: primeiro pacote = secret key
-            const msg = buffer.toString('utf8').trim();
-            if (msg === TUNNEL_SECRET) {
-                authenticated = true;
-                tunnelSocket = socket;
-                socket.write('OK\n');
-                console.log('[TUNNEL] Celular autenticado e conectado!');
-                buffer = Buffer.alloc(0);
-            } else if (buffer.length > 256) {
-                console.log('[TUNNEL] Autenticação falhou');
-                socket.destroy();
-            }
-            return;
-        }
-        
-        // Dados do túnel: respostas das conexões
-        handleTunnelData(data);
-    });
-    
-    socket.on('close', () => {
-        console.log('[TUNNEL] Celular desconectado');
-        if (tunnelSocket === socket) {
-            tunnelSocket = null;
-        }
-    });
-    
-    socket.on('error', (err) => {
-        console.log('[TUNNEL] Erro:', err.message);
-        if (tunnelSocket === socket) {
-            tunnelSocket = null;
-        }
-    });
-    
-    // Keepalive
-    socket.setKeepAlive(true, 30000);
-    socket.setTimeout(0);
+// === HEALTH CHECK HTTP (para Railway não matar o container) ===
+const httpServer = http.createServer((req, res) => {
+    if (req.url === '/health' || req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'online',
+            tunnel: tunnelSocket !== null && !tunnelSocket.destroyed,
+            connections: activePipes.size
+        }));
+    } else {
+        res.writeHead(404);
+        res.end();
+    }
 });
 
-// === SERVIDOR SOCKS5 (recebe conexão do PC) ===
-const socksServer = net.createServer((clientSocket) => {
+httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
+    console.log(`[HTTP] Health check na porta ${HTTP_PORT}`);
+});
+
+// === SERVIDOR TCP PRINCIPAL (porta 7777 → exposta como 32618) ===
+const mainServer = net.createServer((socket) => {
+    socket.once('data', (firstChunk) => {
+        // Detectar tipo de conexão pelo primeiro byte
+        if (firstChunk[0] === 0x05) {
+            // SOCKS5 - conexão do PC
+            handleSocks5(socket, firstChunk);
+        } else {
+            // Túnel - conexão do celular
+            handleTunnel(socket, firstChunk);
+        }
+    });
+
+    socket.on('error', () => {});
+    socket.setTimeout(60000, () => {
+        if (!tunnelSocket || tunnelSocket !== socket) {
+            socket.destroy();
+        }
+    });
+});
+
+mainServer.listen(TCP_PORT, '0.0.0.0', () => {
+    console.log(`[TCP] Servidor SOCKS5 + Túnel na porta ${TCP_PORT}`);
+    console.log('[TCP] Aguardando celular e PC...');
+});
+
+// === HANDLER DO TÚNEL (CELULAR) ===
+function handleTunnel(socket, firstChunk) {
+    const msg = firstChunk.toString('utf8').trim();
+
+    if (msg === TUNNEL_SECRET) {
+        // Fechar túnel anterior se existir
+        if (tunnelSocket && !tunnelSocket.destroyed) {
+            tunnelSocket.destroy();
+        }
+
+        tunnelSocket = socket;
+        tunnelAuthenticated = true;
+        tunnelBuffer = '';
+        socket.write('OK\n');
+        console.log('[TUNNEL] Celular conectado e autenticado!');
+
+        socket.setKeepAlive(true, 15000);
+        socket.setTimeout(0);
+
+        socket.on('data', (data) => {
+            handleTunnelData(data);
+        });
+
+        socket.on('close', () => {
+            console.log('[TUNNEL] Celular desconectou');
+            if (tunnelSocket === socket) {
+                tunnelSocket = null;
+                tunnelAuthenticated = false;
+            }
+        });
+
+        socket.on('error', (err) => {
+            console.log('[TUNNEL] Erro:', err.message);
+            if (tunnelSocket === socket) {
+                tunnelSocket = null;
+                tunnelAuthenticated = false;
+            }
+        });
+    } else {
+        // Autenticação falhou
+        console.log('[TUNNEL] Auth falhou, fechando');
+        socket.destroy();
+    }
+}
+
+// === HANDLER SOCKS5 (PC) ===
+function handleSocks5(socket, firstChunk) {
     let state = 'greeting';
-    let buffer = Buffer.alloc(0);
-    
-    clientSocket.on('data', (data) => {
-        buffer = Buffer.concat([buffer, data]);
-        
+    let buffer = firstChunk;
+
+    function processBuffer() {
         if (state === 'greeting') {
-            // SOCKS5 greeting
             if (buffer.length < 3) return;
-            
             const ver = buffer[0];
             const nmethods = buffer[1];
-            
-            if (ver !== 0x05) {
-                clientSocket.destroy();
-                return;
-            }
-            
+            if (ver !== 0x05) { socket.destroy(); return; }
             if (buffer.length < 2 + nmethods) return;
-            
-            // Responder que requer autenticação user/pass (método 0x02)
-            clientSocket.write(Buffer.from([0x05, 0x02]));
+
+            // Requer autenticação user/pass
+            socket.write(Buffer.from([0x05, 0x02]));
+            buffer = buffer.slice(2 + nmethods);
             state = 'auth';
-            buffer = Buffer.alloc(0);
+            processBuffer();
         }
         else if (state === 'auth') {
-            // Autenticação user/pass (RFC 1929)
             if (buffer.length < 2) return;
-            
-            const ver = buffer[0]; // deve ser 0x01
             const ulen = buffer[1];
-            
             if (buffer.length < 2 + ulen + 1) return;
             const username = buffer.slice(2, 2 + ulen).toString('utf8');
-            
             const plen = buffer[2 + ulen];
             if (buffer.length < 2 + ulen + 1 + plen) return;
             const password = buffer.slice(2 + ulen + 1, 2 + ulen + 1 + plen).toString('utf8');
-            
+
             if (username === PROXY_USER && password === PROXY_PASS) {
-                // Sucesso
-                clientSocket.write(Buffer.from([0x01, 0x00]));
+                socket.write(Buffer.from([0x01, 0x00]));
+                buffer = buffer.slice(2 + ulen + 1 + plen);
                 state = 'request';
-                buffer = Buffer.alloc(0);
+                processBuffer();
             } else {
-                // Falha
-                console.log(`[SOCKS5] Auth falhou: ${username}/${password}`);
-                clientSocket.write(Buffer.from([0x01, 0x01]));
-                clientSocket.destroy();
+                console.log(`[SOCKS5] Auth falhou: ${username}`);
+                socket.write(Buffer.from([0x01, 0x01]));
+                socket.destroy();
             }
         }
         else if (state === 'request') {
-            // SOCKS5 request
             if (buffer.length < 4) return;
-            
-            const ver = buffer[0];
             const cmd = buffer[1];
             const atyp = buffer[3];
-            
+
             let targetHost = '';
             let targetPort = 0;
             let headerLen = 0;
-            
+
             if (atyp === 0x01) {
-                // IPv4
                 if (buffer.length < 10) return;
                 targetHost = `${buffer[4]}.${buffer[5]}.${buffer[6]}.${buffer[7]}`;
                 targetPort = buffer.readUInt16BE(8);
                 headerLen = 10;
-            }
-            else if (atyp === 0x03) {
-                // Domain
+            } else if (atyp === 0x03) {
                 const domainLen = buffer[4];
                 if (buffer.length < 5 + domainLen + 2) return;
                 targetHost = buffer.slice(5, 5 + domainLen).toString('utf8');
                 targetPort = buffer.readUInt16BE(5 + domainLen);
                 headerLen = 5 + domainLen + 2;
-            }
-            else if (atyp === 0x04) {
-                // IPv6
+            } else if (atyp === 0x04) {
                 if (buffer.length < 22) return;
-                const ipv6Parts = [];
+                const parts = [];
                 for (let i = 0; i < 16; i += 2) {
-                    ipv6Parts.push(buffer.readUInt16BE(4 + i).toString(16));
+                    parts.push(buffer.readUInt16BE(4 + i).toString(16));
                 }
-                targetHost = ipv6Parts.join(':');
+                targetHost = parts.join(':');
                 targetPort = buffer.readUInt16BE(20);
                 headerLen = 22;
             }
-            
+
             if (cmd !== 0x01) {
-                // Apenas CONNECT suportado
-                const reply = Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-                clientSocket.write(reply);
-                clientSocket.destroy();
+                socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+                socket.destroy();
                 return;
             }
-            
-            console.log(`[SOCKS5] Conectando: ${targetHost}:${targetPort}`);
-            
-            // Verificar se o túnel do celular está ativo
-            if (!tunnelSocket || tunnelSocket.destroyed) {
-                console.log('[SOCKS5] Túnel do celular não conectado!');
-                // Conectar diretamente (fallback)
-                connectDirect(clientSocket, targetHost, targetPort);
-            } else {
-                // Rotear pelo celular via túnel
-                connectViaTunnel(clientSocket, targetHost, targetPort);
-            }
-            
+
+            buffer = buffer.slice(headerLen);
             state = 'connected';
-            buffer = Buffer.alloc(0);
+
+            console.log(`[SOCKS5] → ${targetHost}:${targetPort}`);
+
+            // Rotear pelo celular ou direto
+            if (tunnelSocket && !tunnelSocket.destroyed && tunnelAuthenticated) {
+                connectViaTunnel(socket, targetHost, targetPort, buffer);
+            } else {
+                connectDirect(socket, targetHost, targetPort, buffer);
+            }
+        }
+    }
+
+    socket.on('data', (data) => {
+        if (state !== 'connected') {
+            buffer = Buffer.concat([buffer, data]);
+            processBuffer();
         }
     });
-    
-    clientSocket.on('error', (err) => {
-        // Silenciar erros de conexão reset
-    });
-});
 
-// === CONEXÃO DIRETA (fallback quando celular não está conectado) ===
-function connectDirect(clientSocket, host, port) {
-    const remote = net.createConnection({ host, port }, () => {
-        // Sucesso - enviar reply SOCKS5
-        const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-        clientSocket.write(reply);
-        
-        // Pipe bidirecional
-        clientSocket.pipe(remote);
-        remote.pipe(clientSocket);
-    });
-    
-    remote.on('error', (err) => {
-        console.log(`[DIRECT] Erro conectando ${host}:${port} - ${err.message}`);
-        const reply = Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-        clientSocket.write(reply);
-        clientSocket.destroy();
-    });
-    
-    clientSocket.on('close', () => remote.destroy());
-    remote.on('close', () => clientSocket.destroy());
+    socket.on('error', () => {});
+    processBuffer();
 }
 
-// === CONEXÃO VIA TÚNEL DO CELULAR ===
-function connectViaTunnel(clientSocket, host, port) {
+// === CONEXÃO VIA TÚNEL (pelo celular 5G) ===
+function connectViaTunnel(clientSocket, host, port, remainingData) {
     const connId = connectionId++;
-    
-    // Enviar request de conexão para o celular
-    const request = JSON.stringify({
-        type: 'connect',
-        id: connId,
-        host: host,
-        port: port
-    }) + '\n';
-    
+
+    const request = JSON.stringify({ type: 'connect', id: connId, host, port }) + '\n';
     try {
         tunnelSocket.write(request);
     } catch (err) {
-        console.log('[TUNNEL] Erro ao enviar request:', err.message);
-        connectDirect(clientSocket, host, port);
+        connectDirect(clientSocket, host, port, remainingData);
         return;
     }
-    
-    // Registrar conexão pendente
-    pendingConnections.set(connId, {
-        clientSocket,
-        host,
-        port,
-        timestamp: Date.now()
-    });
-    
-    // Timeout de 15s
+
+    pendingConnections.set(connId, { clientSocket, host, port, remainingData, timestamp: Date.now() });
+
     setTimeout(() => {
         if (pendingConnections.has(connId)) {
-            console.log(`[TUNNEL] Timeout para ${host}:${port}`);
             pendingConnections.delete(connId);
-            // Fallback para conexão direta
-            connectDirect(clientSocket, host, port);
+            connectDirect(clientSocket, host, port, remainingData);
         }
     }, 15000);
 }
 
-// === PROCESSAR DADOS DO TÚNEL ===
-let tunnelBuffer = '';
+// === CONEXÃO DIRETA (fallback) ===
+function connectDirect(clientSocket, host, port, remainingData) {
+    const remote = net.createConnection({ host, port }, () => {
+        const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        clientSocket.write(reply);
+        if (remainingData && remainingData.length > 0) {
+            remote.write(remainingData);
+        }
+        clientSocket.pipe(remote);
+        remote.pipe(clientSocket);
+    });
 
+    remote.on('error', (err) => {
+        const reply = Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        clientSocket.write(reply);
+        clientSocket.destroy();
+    });
+
+    clientSocket.on('close', () => remote.destroy());
+    remote.on('close', () => clientSocket.destroy());
+}
+
+// === PROCESSAR DADOS DO TÚNEL ===
 function handleTunnelData(data) {
     tunnelBuffer += data.toString('utf8');
-    
-    let newlineIndex;
-    while ((newlineIndex = tunnelBuffer.indexOf('\n')) !== -1) {
-        const line = tunnelBuffer.slice(0, newlineIndex);
-        tunnelBuffer = tunnelBuffer.slice(newlineIndex + 1);
-        
+
+    let idx;
+    while ((idx = tunnelBuffer.indexOf('\n')) !== -1) {
+        const line = tunnelBuffer.slice(0, idx);
+        tunnelBuffer = tunnelBuffer.slice(idx + 1);
+
         try {
             const msg = JSON.parse(line);
-            
+
             if (msg.type === 'connected') {
                 const pending = pendingConnections.get(msg.id);
                 if (pending) {
                     pendingConnections.delete(msg.id);
-                    
-                    // Sucesso - enviar reply SOCKS5
                     const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
                     pending.clientSocket.write(reply);
-                    
-                    // Agora os dados vão fluir pelo túnel
-                    // Criar um sub-canal para esta conexão
+                    if (pending.remainingData && pending.remainingData.length > 0) {
+                        tunnelSocket.write(JSON.stringify({
+                            type: 'data', id: msg.id,
+                            payload: pending.remainingData.toString('base64')
+                        }) + '\n');
+                    }
                     setupTunnelPipe(msg.id, pending.clientSocket);
                 }
             }
@@ -283,17 +289,13 @@ function handleTunnelData(data) {
                 const pending = pendingConnections.get(msg.id);
                 if (pending) {
                     pendingConnections.delete(msg.id);
-                    console.log(`[TUNNEL] Erro do celular: ${msg.error}`);
-                    // Fallback
-                    connectDirect(pending.clientSocket, pending.host, pending.port);
+                    connectDirect(pending.clientSocket, pending.host, pending.port, pending.remainingData);
                 }
             }
             else if (msg.type === 'data') {
-                // Dados recebidos do celular para uma conexão
                 const pipe = activePipes.get(msg.id);
-                if (pipe) {
-                    const decoded = Buffer.from(msg.payload, 'base64');
-                    pipe.write(decoded);
+                if (pipe && !pipe.destroyed) {
+                    pipe.write(Buffer.from(msg.payload, 'base64'));
                 }
             }
             else if (msg.type === 'close') {
@@ -304,50 +306,39 @@ function handleTunnelData(data) {
                 }
             }
             else if (msg.type === 'ping') {
-                // Responder keepalive
                 if (tunnelSocket && !tunnelSocket.destroyed) {
                     tunnelSocket.write(JSON.stringify({ type: 'pong' }) + '\n');
                 }
             }
-        } catch (err) {
-            // Ignorar linhas inválidas
-        }
+        } catch (err) {}
     }
 }
 
-// === PIPES ATIVOS (dados fluindo pelo túnel) ===
-const activePipes = new Map();
-
+// === PIPE DE DADOS PC ↔ CELULAR ===
 function setupTunnelPipe(connId, clientSocket) {
     activePipes.set(connId, clientSocket);
-    
+
     clientSocket.on('data', (data) => {
         if (tunnelSocket && !tunnelSocket.destroyed) {
-            const msg = JSON.stringify({
-                type: 'data',
-                id: connId,
+            tunnelSocket.write(JSON.stringify({
+                type: 'data', id: connId,
                 payload: data.toString('base64')
-            }) + '\n';
-            tunnelSocket.write(msg);
+            }) + '\n');
         }
     });
-    
-    clientSocket.on('close', () => {
+
+    const cleanup = () => {
         activePipes.delete(connId);
         if (tunnelSocket && !tunnelSocket.destroyed) {
             tunnelSocket.write(JSON.stringify({ type: 'close', id: connId }) + '\n');
         }
-    });
-    
-    clientSocket.on('error', () => {
-        activePipes.delete(connId);
-        if (tunnelSocket && !tunnelSocket.destroyed) {
-            tunnelSocket.write(JSON.stringify({ type: 'close', id: connId }) + '\n');
-        }
-    });
+    };
+
+    clientSocket.on('close', cleanup);
+    clientSocket.on('error', cleanup);
 }
 
-// === LIMPEZA PERIÓDICA ===
+// === LIMPEZA ===
 setInterval(() => {
     const now = Date.now();
     for (const [id, conn] of pendingConnections) {
@@ -358,81 +349,9 @@ setInterval(() => {
     }
 }, 30000);
 
-// === STATUS ENDPOINT (HTTP na mesma porta que o túnel) ===
-const http = require('http');
-const statusServer = http.createServer((req, res) => {
-    if (req.url === '/status') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-            status: 'online',
-            tunnel_connected: tunnelSocket !== null && !tunnelSocket.destroyed,
-            active_connections: activePipes.size,
-            pending_connections: pendingConnections.size,
-            proxy_port: PROXY_PORT,
-            uptime: process.uptime()
-        }));
-    } else if (req.url === '/health') {
-        res.writeHead(200);
-        res.end('OK');
-    } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(`
-            <h1>5G-SHARE - Servidor Proxy</h1>
-            <p>Status: ONLINE</p>
-            <p>Celular conectado: ${tunnelSocket !== null && !tunnelSocket.destroyed ? 'SIM' : 'NÃO'}</p>
-            <p>Conexões ativas: ${activePipes.size}</p>
-            <hr>
-            <p><b>Para conectar seu PC:</b></p>
-            <ul>
-                <li>Protocolo: SOCKS5</li>
-                <li>Host: (seu domínio railway)</li>
-                <li>Porta: ${PROXY_PORT}</li>
-                <li>Usuário: ${PROXY_USER}</li>
-                <li>Senha: ****</li>
-            </ul>
-        `);
-    }
-});
-
-// === INICIAR SERVIDORES ===
-// O Railway expõe apenas uma porta (PORT), então vamos multiplexar
-// Detectar se a conexão é SOCKS5 ou HTTP ou Tunnel pelo primeiro byte
-
-const mainServer = net.createServer((socket) => {
-    socket.once('data', (data) => {
-        if (data[0] === 0x05) {
-            // SOCKS5 - proxy do PC
-            socksServer.emit('connection', socket);
-            socket.unshift(data);
-        } else if (data.toString('utf8').startsWith('GET') || data.toString('utf8').startsWith('HEAD')) {
-            // HTTP - status page
-            statusServer.emit('connection', socket);
-            socket.unshift(data);
-        } else {
-            // Tunnel - conexão do celular
-            tunnelServer.emit('connection', socket);
-            socket.unshift(data);
-        }
-    });
-    
-    socket.on('error', () => {});
-});
-
-mainServer.listen(PROXY_PORT, '0.0.0.0', () => {
-    console.log(`[SERVER] Servidor principal rodando na porta ${PROXY_PORT}`);
-    console.log(`[SERVER] Aguardando conexão do celular...`);
-    console.log('');
-    console.log('=== DADOS PARA O PC ===');
-    console.log(`Protocolo: SOCKS5`);
-    console.log(`Porta: ${PROXY_PORT}`);
-    console.log(`Usuário: ${PROXY_USER}`);
-    console.log(`Senha: ${PROXY_PASS}`);
-    console.log('=======================');
-});
-
-// Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('[SERVER] Encerrando...');
     mainServer.close();
+    httpServer.close();
     process.exit(0);
 });
