@@ -10,8 +10,8 @@
 
 # === CONFIGURAÇÕES ===
 # Edite aqui com os dados do seu TCP Proxy (porta 1080)
-RAILWAY_HOST="nozomi.proxy.rlwy.net"
-RAILWAY_PORT="33719"
+RAILWAY_HOST="hayabusa.proxy.rlwy.net"
+RAILWAY_PORT="32871"
 TUNNEL_USER="tunnel"
 TUNNEL_PASS="proxypass123"
 
