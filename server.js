@@ -13,7 +13,7 @@ const pendingConnections = new Map();
 const activePipes = new Map();
 let connectionId = 0;
 
-console.log('=== 5G-SHARE v2.3 ===');
+console.log('=== 5G-SHARE v2.4 ===');
 console.log(`Porta: ${PORT}`);
 console.log(`User: ${PROXY_USER}`);
 console.log(`Secret: ${TUNNEL_SECRET}`);
@@ -25,10 +25,20 @@ const server = net.createServer((socket) => {
         const firstByte = chunk[0];
         if (firstByte === 0x05) {
             handleSocks5(socket, chunk);
-        } else if (firstByte === 0x47 || firstByte === 0x48) {
+        } else if (firstByte === 0x47 || firstByte === 0x48 || firstByte === 0x50) {
+            // G=GET, H=HEAD, P=POST - HTTP health check
             handleHttp(socket, chunk);
         } else {
-            handleTunnel(socket, chunk);
+            // Verificar se é realmente o tunnel secret antes de tratar como túnel
+            const msg = chunk.toString('utf8').trim();
+            if (msg === TUNNEL_SECRET) {
+                handleTunnel(socket, msg);
+            } else {
+                // Conexão desconhecida - pode ser health check do Railway ou lixo
+                // NÃO destruir o túnel existente
+                console.log(`[IGNORE] Conexão desconhecida: "${msg.substring(0, 20)}"`);
+                socket.destroy();
+            }
         }
     });
     socket.on('error', () => {});
@@ -50,37 +60,58 @@ function handleHttp(socket) {
 }
 
 // === TÚNEL (CELULAR) ===
-function handleTunnel(socket, chunk) {
-    const msg = chunk.toString('utf8').trim();
-    console.log(`[TUNNEL] Auth: "${msg}"`);
+function handleTunnel(socket, secret) {
+    console.log('[TUNNEL] Nova conexão do celular');
 
-    if (msg === TUNNEL_SECRET) {
-        if (tunnelSocket && !tunnelSocket.destroyed) tunnelSocket.destroy();
-        tunnelSocket = socket;
-        tunnelBuffer = '';
-        socket.write('OK\n');
-        console.log('[TUNNEL] Celular conectado!');
-        socket.setKeepAlive(true, 15000);
-        socket.setNoDelay(true);
-        socket.setTimeout(0);
-        socket.on('data', processTunnelData);
-        socket.on('close', () => { if (tunnelSocket === socket) tunnelSocket = null; console.log('[TUNNEL] Desconectou'); });
-        socket.on('error', () => { if (tunnelSocket === socket) tunnelSocket = null; });
-    } else {
-        socket.destroy();
+    // Só substituir se o túnel anterior está morto
+    if (tunnelSocket && !tunnelSocket.destroyed) {
+        // Verificar se o túnel antigo ainda está vivo com um ping
+        try {
+            tunnelSocket.write(JSON.stringify({ type: 'ping' }) + '\n');
+            // Se não deu erro, o túnel antigo está vivo - rejeitar o novo
+            // MAS: se o celular está reconectando, é porque o antigo morreu do lado dele
+            // Então vamos aceitar o novo e fechar o antigo graciosamente
+            tunnelSocket.removeAllListeners('data');
+            tunnelSocket.removeAllListeners('close');
+            tunnelSocket.removeAllListeners('error');
+            tunnelSocket.destroy();
+        } catch (e) {
+            // Túnel antigo já está morto
+        }
     }
+
+    tunnelSocket = socket;
+    tunnelBuffer = '';
+    socket.write('OK\n');
+    console.log('[TUNNEL] Celular autenticado!');
+
+    socket.setKeepAlive(true, 30000);
+    socket.setNoDelay(true);
+    socket.setTimeout(0);
+
+    socket.on('data', processTunnelData);
+    socket.on('close', () => {
+        if (tunnelSocket === socket) {
+            tunnelSocket = null;
+            console.log('[TUNNEL] Celular desconectou');
+        }
+    });
+    socket.on('error', (err) => {
+        if (tunnelSocket === socket) {
+            tunnelSocket = null;
+            console.log('[TUNNEL] Erro:', err.message);
+        }
+    });
 }
 
 // === SOCKS5 (PC) ===
 function handleSocks5(socket, firstChunk) {
     let buf = firstChunk;
 
-    // Passo 1: Greeting
     const nmethods = buf[1];
-    socket.write(Buffer.from([0x05, 0x02])); // requer user/pass
+    socket.write(Buffer.from([0x05, 0x02]));
     buf = buf.slice(2 + nmethods);
 
-    // Se já tem dados de auth no mesmo chunk, processar
     if (buf.length > 0) {
         processAuth(socket, buf);
     } else {
@@ -104,7 +135,7 @@ function processAuth(socket, buf) {
         return;
     }
 
-    socket.write(Buffer.from([0x01, 0x00])); // auth ok
+    socket.write(Buffer.from([0x01, 0x00]));
     buf = buf.slice(2 + ulen + 1 + plen);
 
     if (buf.length > 0) {
@@ -175,7 +206,7 @@ function tunnelConnect(client, host, port, extra) {
 
     setTimeout(() => {
         if (pendingConnections.has(id)) {
-            console.log(`[TIMEOUT] ${host}:${port}, fallback direto`);
+            console.log(`[TIMEOUT] ${host}:${port}`);
             pendingConnections.delete(id);
             directConnect(client, host, port, extra);
         }
@@ -212,13 +243,10 @@ function processTunnelData(data) {
                 const p = pendingConnections.get(msg.id);
                 if (p) {
                     pendingConnections.delete(msg.id);
-                    // Responder SOCKS5 success ao PC
                     p.client.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-                    // Se tinha dados pendentes, enviar ao celular
                     if (p.extra && p.extra.length) {
                         tunnelSocket.write(JSON.stringify({ type: 'data', id: msg.id, payload: p.extra.toString('base64') }) + '\n');
                     }
-                    // Configurar pipe bidirecional
                     setupPipe(msg.id, p.client);
                 }
             }
@@ -230,11 +258,8 @@ function processTunnelData(data) {
                 }
             }
             else if (msg.type === 'data') {
-                // Dados vindos do celular → enviar para o PC
                 const c = activePipes.get(msg.id);
-                if (c && !c.destroyed) {
-                    c.write(Buffer.from(msg.payload, 'base64'));
-                }
+                if (c && !c.destroyed) c.write(Buffer.from(msg.payload, 'base64'));
             }
             else if (msg.type === 'close') {
                 const c = activePipes.get(msg.id);
@@ -252,7 +277,6 @@ function processTunnelData(data) {
 function setupPipe(id, client) {
     activePipes.set(id, client);
 
-    // Dados do PC → enviar para o celular
     const onData = (d) => {
         if (tunnelSocket && !tunnelSocket.destroyed)
             tunnelSocket.write(JSON.stringify({ type: 'data', id, payload: d.toString('base64') }) + '\n');

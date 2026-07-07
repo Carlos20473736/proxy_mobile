@@ -39,9 +39,22 @@ const SECRET = process.env.SS || 'senha123';
 
 let socket = null;
 let buffer = '';
+let pingInterval = null;
+let reconnectTimer = null;
 const activeConns = new Map();
 
 function connect() {
+    // Limpar estado anterior
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    buffer = '';
+
+    // Fechar conexões ativas antigas
+    for (const [id, c] of activeConns) {
+        c.destroy();
+    }
+    activeConns.clear();
+
     console.log(`[TUNNEL] Conectando ${HOST}:${PORT}...`);
 
     socket = net.createConnection({ host: HOST, port: PORT }, () => {
@@ -49,7 +62,7 @@ function connect() {
         socket.write(SECRET + '\n');
     });
 
-    socket.setKeepAlive(true, 15000);
+    socket.setKeepAlive(true, 30000);
     socket.setNoDelay(true);
     socket.setTimeout(0);
 
@@ -57,16 +70,20 @@ function connect() {
 
     socket.on('data', (data) => {
         if (!authed) {
-            if (data.toString().trim() === 'OK') {
+            const resp = data.toString().trim();
+            if (resp === 'OK') {
                 authed = true;
                 console.log('[TUNNEL] ✅ ATIVO! PC pode usar o 5G agora.');
-                setInterval(() => {
+                // Ping a cada 25s para manter conexão viva
+                pingInterval = setInterval(() => {
                     if (socket && !socket.destroyed) {
-                        socket.write(JSON.stringify({type:'ping'}) + '\n');
+                        try {
+                            socket.write(JSON.stringify({type:'ping'}) + '\n');
+                        } catch(e) {}
                     }
-                }, 20000);
+                }, 25000);
             } else {
-                console.log('[TUNNEL] Auth falhou');
+                console.log('[TUNNEL] Auth falhou:', resp);
                 socket.destroy();
             }
             return;
@@ -82,13 +99,15 @@ function connect() {
     });
 
     socket.on('close', () => {
-        console.log('[TUNNEL] Desconectou. Reconectando em 3s...');
+        console.log('[TUNNEL] Desconectou. Reconectando em 5s...');
         authed = false;
-        setTimeout(connect, 3000);
+        if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+        reconnectTimer = setTimeout(connect, 5000);
     });
 
     socket.on('error', (err) => {
         console.log('[TUNNEL] Erro:', err.message);
+        // Não reconectar aqui - o 'close' event vai tratar
     });
 }
 
@@ -124,11 +143,21 @@ function processMsg(msg) {
 }
 
 function send(obj) {
-    if (socket && !socket.destroyed) socket.write(JSON.stringify(obj) + '\n');
+    if (socket && !socket.destroyed) {
+        try {
+            socket.write(JSON.stringify(obj) + '\n');
+        } catch(e) {}
+    }
 }
 
 connect();
 process.on('SIGINT', () => { console.log('\nEncerrando...'); process.exit(0); });
+process.on('uncaughtException', (err) => {
+    console.log('[TUNNEL] Erro fatal:', err.message);
+    // Reconectar
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    reconnectTimer = setTimeout(connect, 5000);
+});
 EOF
 
 echo -e "${GREEN}[✓] Túnel iniciado${NC}"
