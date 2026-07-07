@@ -27,10 +27,10 @@ fi
 
 # 2) Iniciar sslh na porta 7777
 # SSH → sshd:2222
-# Qualquer outra coisa (SOCKS5) → porta 8800 (reverse tunnel do celular)
+# Qualquer outra coisa (SOCKS5) → porta 8801 (reverse tunnel do celular)
 echo "[2/2] Iniciando sslh na porta 7777..."
 echo "  SSH    → 127.0.0.1:2222"
-echo "  SOCKS5 → 127.0.0.1:8800 (reverse tunnel)"
+echo "  SOCKS5 → 127.0.0.1:8801 (reverse tunnel)"
 echo ""
 echo "=== PRONTO! Aguardando conexão do celular ==="
 echo "  Quando celular conectar, SOCKS5 ficará disponível."
@@ -38,5 +38,5 @@ echo "  Quando celular conectar, SOCKS5 ficará disponível."
 exec sslh --foreground \
     --listen 0.0.0.0:7777 \
     --ssh 127.0.0.1:2222 \
-    --anyprot 127.0.0.1:8800 \
+    --anyprot 127.0.0.1:8801 \
     --timeout 5
