@@ -1,90 +1,46 @@
-# 5G-SHARE - Proxy Mobile via Railway
+# 5G-SHARE v5.0 - Velocidade Máxima
 
-Compartilhe a internet 5G do seu celular com qualquer PC, de qualquer lugar do mundo, sem precisar estar na mesma rede.
+Compartilhe a internet 5G do celular com o PC na velocidade máxima, sem estar na mesma rede.
 
-## Como Funciona
+## Arquitetura
 
 ```
-[PC] ──SOCKS5──→ [Railway Server] ←──Túnel──→ [Termux/Celular 5G] ──→ [Internet]
+[PC] → Cloudflare (SP) → [Celular 5G] → Internet
 ```
 
-O PC conecta direto no servidor Railway usando **host + porta + usuário + senha** (SOCKS5).
-O celular mantém um túnel aberto com o Railway, roteando todo o tráfego pelo 5G.
+O tráfego passa pelo datacenter Cloudflare em São Paulo — latência mínima, velocidade máxima.
 
-**Velocidade:** Mesma do seu 5G. Sem throttling de tethering.
+## Como usar
 
----
+### 1. No Celular (Termux)
 
-## Configuração
+```bash
+curl -sL https://raw.githubusercontent.com/Carlos20473736/proxy_mobile/main/start-celular.sh | bash
+```
 
-### 1. Deploy no Railway
+Anote o **Host** que aparecer na tela.
 
-1. Faça deploy deste repositório no Railway
-2. Configure as variáveis de ambiente no Railway:
+### 2. No PC (Windows)
 
-| Variável | Valor | Descrição |
-|----------|-------|-----------|
-| `PORT` | `1080` | Porta do servidor (Railway define automaticamente) |
-| `PROXY_USER` | `5guser` | Usuário para o PC conectar |
-| `PROXY_PASS` | `sua_senha_aqui` | Senha para o PC conectar |
-| `TUNNEL_SECRET` | `sua_chave_secreta` | Chave para autenticar o celular |
+1. Baixe o `cloudflared`: [Download](https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe)
+2. Coloque em `C:\cloudflared\`
+3. Rode o `conectar-pc.bat` (ou `conectar-pc.ps1`)
+4. Cole o Host que apareceu no celular
 
-3. Anote o domínio público gerado pelo Railway (ex: `proxy-mobile-production.up.railway.app`)
-4. **IMPORTANTE:** No Railway, vá em Settings > Networking e habilite **TCP Proxy** (não apenas HTTP). Anote a porta TCP pública gerada.
-
-### 2. Configurar o Celular (Termux)
-
-1. Instale o [Termux](https://f-droid.org/packages/com.termux/) no celular
-2. Copie o arquivo `start-celular.sh` para o Termux
-3. Execute:
-   ```bash
-   pkg install nodejs-lts
-   bash start-celular.sh
-   ```
-4. Digite o host e porta do Railway quando solicitado
-5. Pronto! O túnel está ativo.
-
-### 3. Configurar o PC
-
-No seu PC, configure o proxy SOCKS5 com os dados:
+### 3. No Fingerprint Manager
 
 | Campo | Valor |
 |-------|-------|
-| Protocolo | **SOCKS5** |
-| Host | `seu-app.railway.app` (ou IP do TCP Proxy) |
-| Porta | A porta TCP pública do Railway |
-| Usuário | O que você definiu em `PROXY_USER` |
-| Senha | O que você definiu em `PROXY_PASS` |
+| Protocolo | SOCKS5 |
+| Host | 127.0.0.1 |
+| Porta | 1080 |
+| Usuário | 5guser |
+| Senha | senha123 |
 
-Pode configurar em:
-- Navegador (Firefox: Configurações > Rede > Proxy Manual)
-- Sistema (Windows: Configurações > Rede > Proxy)
-- Qualquer app que suporte SOCKS5
+## Por que é rápido?
 
----
-
-## Variáveis de Ambiente
-
-| Variável | Padrão | Descrição |
-|----------|--------|-----------|
-| `PORT` | `1080` | Porta principal do servidor |
-| `PROXY_USER` | `5guser` | Usuário SOCKS5 |
-| `PROXY_PASS` | `senha123` | Senha SOCKS5 |
-| `TUNNEL_SECRET` | `tunnel_secret_key` | Chave de autenticação do túnel |
-
----
-
-## Endpoints HTTP
-
-- `GET /` - Página de status
-- `GET /status` - Status em JSON
-- `GET /health` - Health check
-
----
-
-## Notas
-
-- O servidor detecta automaticamente se a conexão é SOCKS5 (PC), HTTP (status) ou Túnel (celular)
-- Se o celular desconectar, o servidor faz fallback para conexão direta (usando a internet do Railway)
-- O celular reconecta automaticamente se a conexão cair
-- Use `termux-wake-lock` no Termux para manter o celular ativo
+- **Sem Base64** — dados binários puros
+- **Sem intermediário nos EUA** — Cloudflare tem datacenter em SP
+- **microsocks** — proxy SOCKS5 nativo em C (não Node.js)
+- **Sem overhead** — conexão TCP direta via túnel
+- **Sem throttling** — operadora vê como uso normal do celular

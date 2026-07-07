@@ -1,194 +1,191 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-# 5G-SHARE v4.0 SPEED - Celular (Termux)
-# Protocolo binário = velocidade máxima do 5G
+# 5G-SHARE v5.0 - VELOCIDADE MÁXIMA (Cloudflare Tunnel)
+# Roda proxy SOCKS5 local + expõe via Cloudflare (datacenter SP)
 # ============================================================
-
-SERVER_HOST="hayabusa.proxy.rlwy.net"
-SERVER_PORT="32618"
-TUNNEL_SECRET="senha123"
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
+RED='\033[0;31m'
 NC='\033[0m'
+
+# === CONFIGURAÇÃO ===
+PROXY_PORT=1080
+PROXY_USER="5guser"
+PROXY_PASS="senha123"
+URL_FILE="$HOME/.5gshare-url.txt"
 
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║       5G-SHARE v4.0 SPEED - Velocidade Máxima          ║"
+echo "║    5G-SHARE v5.0 - VELOCIDADE MÁXIMA (Cloudflare)      ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-if ! command -v node &> /dev/null; then
-    echo "[*] Instalando Node.js..."
-    pkg install -y nodejs-lts 2>/dev/null || pkg install -y nodejs
+# === INSTALAR DEPENDÊNCIAS ===
+echo -e "[1/3] Verificando dependências..."
+
+if ! command -v microsocks &> /dev/null; then
+    echo "  → Instalando microsocks..."
+    pkg install -y microsocks 2>/dev/null
 fi
 
+if ! command -v cloudflared &> /dev/null; then
+    echo "  → Instalando cloudflared..."
+    # Baixar binário ARM64 do cloudflared
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "aarch64" ]; then
+        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+    else
+        CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm"
+    fi
+    curl -sL "$CF_URL" -o "$PREFIX/bin/cloudflared"
+    chmod +x "$PREFIX/bin/cloudflared"
+fi
+
+echo -e "  ${GREEN}✓ Dependências OK${NC}"
+
+# === MATAR PROCESSOS ANTERIORES ===
+pkill -f microsocks 2>/dev/null
+pkill -f cloudflared 2>/dev/null
+sleep 1
+
+# === WAKE LOCK ===
 termux-wake-lock 2>/dev/null
 
-cat > /data/data/com.termux/files/home/.5gshare-tunnel.js << 'EOF'
-const net = require('net');
+# === INICIAR PROXY SOCKS5 ===
+echo -e "[2/3] Iniciando proxy SOCKS5..."
+microsocks -i 127.0.0.1 -p $PROXY_PORT -u "$PROXY_USER" -P "$PROXY_PASS" &
+PROXY_PID=$!
+sleep 1
 
-const HOST = process.env.SH || 'hayabusa.proxy.rlwy.net';
-const PORT = parseInt(process.env.SP || '32618');
-const SECRET = process.env.SS || 'senha123';
+if kill -0 $PROXY_PID 2>/dev/null; then
+    echo -e "  ${GREEN}✓ Proxy SOCKS5 rodando na porta $PROXY_PORT${NC}"
+else
+    echo -e "  ${RED}✗ Falha ao iniciar proxy${NC}"
+    exit 1
+fi
 
-/*
-  PROTOCOLO BINÁRIO v4:
-  Header: [TYPE:1byte][ID:2bytes][LEN:4bytes][PAYLOAD:LEN bytes]
-  
-  Sem Base64, sem JSON para dados = velocidade máxima
-*/
-
-const TYPE_CONNECT = 0x01;
-const TYPE_CONNECTED = 0x02;
-const TYPE_DATA = 0x03;
-const TYPE_CLOSE = 0x04;
-const TYPE_ERROR = 0x05;
-const TYPE_PING = 0x06;
-const TYPE_PONG = 0x07;
-const HEADER_SIZE = 7;
-
-let socket = null;
-let rawBuf = Buffer.alloc(0);
-let pingInterval = null;
-let reconnectTimer = null;
-const activeConns = new Map();
-
-function buildPacket(type, id, payload) {
-    const plen = payload ? payload.length : 0;
-    const buf = Buffer.allocUnsafe(HEADER_SIZE + plen);
-    buf[0] = type;
-    buf.writeUInt16BE(id, 1);
-    buf.writeUInt32BE(plen, 3);
-    if (payload && plen > 0) payload.copy(buf, HEADER_SIZE);
-    return buf;
-}
-
-function send(type, id, payload) {
-    if (!socket || socket.destroyed) return;
-    try { socket.write(buildPacket(type, id, payload)); } catch(e) {}
-}
-
-function connect() {
-    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    rawBuf = Buffer.alloc(0);
-    for (const [id, c] of activeConns) { c.destroy(); }
-    activeConns.clear();
-
-    console.log(`[TUNNEL] Conectando ${HOST}:${PORT}...`);
-
-    socket = net.createConnection({ host: HOST, port: PORT }, () => {
-        console.log('[TUNNEL] Conectado! Autenticando...');
-        socket.write(SECRET + '\n');
-    });
-
-    socket.setKeepAlive(true, 30000);
-    socket.setNoDelay(true);
-    socket.setTimeout(0);
-
-    // Aumentar buffers para velocidade
-    try {
-        socket.setRecvBufferSize && socket.setRecvBufferSize(1048576);
-        socket.setSendBufferSize && socket.setSendBufferSize(1048576);
-    } catch(e) {}
-
-    let authed = false;
-
-    socket.on('data', (data) => {
-        if (!authed) {
-            const resp = data.toString().trim();
-            if (resp === 'OK') {
-                authed = true;
-                console.log('[TUNNEL] ✅ ATIVO! Velocidade máxima.');
-                pingInterval = setInterval(() => { send(TYPE_PONG, 0, null); }, 25000);
-            } else {
-                console.log('[TUNNEL] Auth falhou');
-                socket.destroy();
-            }
-            return;
-        }
-
-        // Protocolo binário
-        rawBuf = Buffer.concat([rawBuf, data]);
-        processPackets();
-    });
-
-    socket.on('close', () => {
-        console.log('[TUNNEL] Desconectou. Reconectando em 5s...');
-        authed = false;
-        if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-        reconnectTimer = setTimeout(connect, 5000);
-    });
-
-    socket.on('error', (err) => {
-        console.log('[TUNNEL] Erro:', err.message);
-    });
-}
-
-function processPackets() {
-    while (rawBuf.length >= HEADER_SIZE) {
-        const type = rawBuf[0];
-        const id = rawBuf.readUInt16BE(1);
-        const plen = rawBuf.readUInt32BE(3);
-
-        if (rawBuf.length < HEADER_SIZE + plen) break;
-
-        const payload = plen > 0 ? rawBuf.slice(HEADER_SIZE, HEADER_SIZE + plen) : null;
-        rawBuf = rawBuf.slice(HEADER_SIZE + plen);
-
-        switch (type) {
-            case TYPE_CONNECT: {
-                try {
-                    const info = JSON.parse(payload.toString());
-                    const remote = net.createConnection({ host: info.host, port: info.port }, () => {
-                        remote.setNoDelay(true);
-                        send(TYPE_CONNECTED, id, null);
-                    });
-                    remote.on('data', (d) => { send(TYPE_DATA, id, d); });
-                    remote.on('close', () => { activeConns.delete(id); send(TYPE_CLOSE, id, null); });
-                    remote.on('error', (e) => {
-                        activeConns.delete(id);
-                        send(TYPE_ERROR, id, Buffer.from(e.message));
-                    });
-                    remote.setTimeout(15000, () => { remote.destroy(); });
-                    remote.on('connect', () => { remote.setTimeout(0); });
-                    activeConns.set(id, remote);
-                } catch(e) {
-                    send(TYPE_ERROR, id, Buffer.from('parse error'));
-                }
-                break;
-            }
-            case TYPE_DATA: {
-                const c = activeConns.get(id);
-                if (c && !c.destroyed) c.write(payload);
-                break;
-            }
-            case TYPE_CLOSE: {
-                const c = activeConns.get(id);
-                if (c) { c.destroy(); activeConns.delete(id); }
-                break;
-            }
-            case TYPE_PING: {
-                send(TYPE_PONG, 0, null);
-                break;
-            }
-        }
-    }
-}
-
-connect();
-process.on('SIGINT', () => { console.log('\nEncerrando...'); process.exit(0); });
-process.on('uncaughtException', (err) => {
-    console.log('[TUNNEL] Erro fatal:', err.message);
-    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-    reconnectTimer = setTimeout(connect, 5000);
-});
-EOF
-
-echo -e "${GREEN}[✓] Túnel iniciado (protocolo binário v4)${NC}"
-echo -e "${YELLOW}    Sem Base64, sem JSON = velocidade máxima do 5G${NC}"
+# === INICIAR CLOUDFLARE TUNNEL ===
+echo -e "[3/3] Criando túnel Cloudflare..."
 echo ""
 
-SH="$SERVER_HOST" SP="$SERVER_PORT" SS="$TUNNEL_SECRET" node /data/data/com.termux/files/home/.5gshare-tunnel.js
+# Cloudflared expõe a porta local do proxy via túnel
+cloudflared tunnel --url tcp://127.0.0.1:$PROXY_PORT --no-autoupdate 2>&1 &
+CF_PID=$!
+
+# Esperar URL do túnel aparecer
+echo -e "  Aguardando URL do túnel..."
+TUNNEL_URL=""
+for i in $(seq 1 30); do
+    sleep 1
+    # Cloudflared imprime a URL no stderr
+    TUNNEL_URL=$(cat /proc/$CF_PID/fd/2 2>/dev/null | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
+    if [ -z "$TUNNEL_URL" ]; then
+        # Tentar de outra forma
+        TUNNEL_URL=$(ps aux 2>/dev/null | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
+    fi
+    if [ -n "$TUNNEL_URL" ]; then
+        break
+    fi
+done
+
+# Se não encontrou, usar log file
+if [ -z "$TUNNEL_URL" ]; then
+    # Reiniciar com log
+    kill $CF_PID 2>/dev/null
+    sleep 1
+    CF_LOG="$HOME/.5gshare-cf.log"
+    cloudflared tunnel --url tcp://127.0.0.1:$PROXY_PORT --no-autoupdate > "$CF_LOG" 2>&1 &
+    CF_PID=$!
+    
+    for i in $(seq 1 30); do
+        sleep 1
+        TUNNEL_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1)
+        if [ -n "$TUNNEL_URL" ]; then
+            break
+        fi
+    done
+fi
+
+if [ -z "$TUNNEL_URL" ]; then
+    echo -e "  ${RED}✗ Não conseguiu criar túnel. Tentando método alternativo...${NC}"
+    kill $CF_PID 2>/dev/null
+    sleep 1
+    
+    # Método alternativo: rodar em foreground e capturar
+    CF_LOG="$HOME/.5gshare-cf.log"
+    cloudflared tunnel --url tcp://127.0.0.1:$PROXY_PORT --no-autoupdate 2>"$CF_LOG" &
+    CF_PID=$!
+    
+    for i in $(seq 1 30); do
+        sleep 1
+        TUNNEL_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1)
+        if [ -n "$TUNNEL_URL" ]; then
+            break
+        fi
+    done
+fi
+
+if [ -z "$TUNNEL_URL" ]; then
+    echo -e "  ${RED}✗ Falha ao obter URL do túnel${NC}"
+    echo "  Verifique sua conexão de internet"
+    kill $PROXY_PID $CF_PID 2>/dev/null
+    exit 1
+fi
+
+# Extrair hostname do URL
+TUNNEL_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
+
+# Salvar URL
+echo "$TUNNEL_HOST" > "$URL_FILE"
+
+echo -e "  ${GREEN}✓ Túnel Cloudflare criado!${NC}"
+echo ""
+echo -e "${YELLOW}══════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}"
+echo "  DADOS PARA O PC:"
+echo ""
+echo "  Host: $TUNNEL_HOST"
+echo "  Usuário: $PROXY_USER"
+echo "  Senha: $PROXY_PASS"
+echo ""
+echo "  No PC, rode o conectar-pc.bat"
+echo -e "${NC}"
+echo -e "${YELLOW}══════════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "${GREEN}  ✅ SERVIDOR ATIVO - Pressione Ctrl+C para parar${NC}"
+echo ""
+
+# === MANTER VIVO ===
+cleanup() {
+    echo ""
+    echo "Encerrando..."
+    kill $PROXY_PID $CF_PID 2>/dev/null
+    termux-wake-unlock 2>/dev/null
+    exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# Monitor
+while true; do
+    if ! kill -0 $CF_PID 2>/dev/null; then
+        echo -e "${RED}[!] Túnel caiu. Reiniciando...${NC}"
+        CF_LOG="$HOME/.5gshare-cf.log"
+        cloudflared tunnel --url tcp://127.0.0.1:$PROXY_PORT --no-autoupdate 2>"$CF_LOG" &
+        CF_PID=$!
+        sleep 10
+        NEW_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1)
+        if [ -n "$NEW_URL" ]; then
+            TUNNEL_HOST=$(echo "$NEW_URL" | sed 's|https://||')
+            echo "$TUNNEL_HOST" > "$URL_FILE"
+            echo -e "${GREEN}[✓] Novo túnel: $TUNNEL_HOST${NC}"
+        fi
+    fi
+    if ! kill -0 $PROXY_PID 2>/dev/null; then
+        echo -e "${RED}[!] Proxy caiu. Reiniciando...${NC}"
+        microsocks -i 127.0.0.1 -p $PROXY_PORT -u "$PROXY_USER" -P "$PROXY_PASS" &
+        PROXY_PID=$!
+    fi
+    sleep 15
+done
