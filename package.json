@@ -1,0 +1,14 @@
+{
+  "name": "5gshare-proxy-server",
+  "version": "2.0.0",
+  "description": "Servidor proxy SOCKS5 para compartilhar internet 5G do celular com PC via Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["proxy", "socks5", "5g", "mobile", "tunnel"],
+  "license": "MIT"
+}

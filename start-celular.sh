@@ -1,167 +1,291 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# =============================================
-# PROXY MOBILE v4.1
-# =============================================
-#
-# Fluxo:
-#   1. Microsocks roda no celular (porta 8899)
-#   2. SSH conecta ao Railway via sslh (porta 7777)
-#   3. Reverse tunnel: servidor:8899 ← celular:8899
-#   4. Fingerprint Manager conecta SOCKS5 no mesmo endereço
-#      → sslh detecta que NÃO é SSH
-#      → encaminha para 127.0.0.1:8899 (reverse tunnel)
-#      → chega no microsocks do celular
-#      → sai com IP do celular
-#
-# =============================================
+# ============================================================
+# 5G-SHARE - Script do Celular (Termux)
+# Conecta ao servidor Railway e roteia internet pelo 5G
+# ============================================================
 
-# === CONFIGURAÇÕES ===
-RAILWAY_HOST="hayabusa.proxy.rlwy.net"
-RAILWAY_PORT="32618"
-TUNNEL_USER="tunnel"
-TUNNEL_PASS="proxypass123"
-LOCAL_SOCKS_PORT="8899"
-REMOTE_TUNNEL_PORT="8899"
+set -e
 
-# === CORES ===
+# === CONFIGURAÇÃO ===
+# Coloque aqui o endereço do seu servidor Railway
+SERVER_HOST="${SERVER_HOST:-SEU_APP.railway.app}"
+SERVER_PORT="${SERVER_PORT:-443}"
+TUNNEL_SECRET="${TUNNEL_SECRET:-tunnel_secret_key}"
+
+# Cores
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-BOLD='\033[1m'
 NC='\033[0m'
 
-clear
-echo -e "${CYAN}╔═══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║  PROXY MOBILE v4.1                        ║${NC}"
-echo -e "${CYAN}╠═══════════════════════════════════════════╣${NC}"
-echo -e "${CYAN}║  1 TCP Proxy | sslh + reverse tunnel      ║${NC}"
-echo -e "${CYAN}║  Tudo no mesmo endereço/porta             ║${NC}"
-echo -e "${CYAN}╚═══════════════════════════════════════════╝${NC}"
-echo ""
+CONFIG_FILE="$HOME/.5gshare/config-railway.sh"
 
-# === FUNÇÕES ===
-log() { echo -e "[$(date '+%H:%M:%S')] $1"; }
-
-cleanup() {
-    echo ""
-    log "${YELLOW}Encerrando...${NC}"
-    pkill -f microsocks 2>/dev/null
-    pkill -f "ssh.*${RAILWAY_HOST}" 2>/dev/null
-    exit 0
+mostrar_banner() {
+    echo -e "${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║       5G-SHARE - Celular → Railway (Túnel)             ║"
+    echo "║   Compartilhando internet 5G com seu PC                ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
 }
-trap cleanup SIGINT SIGTERM
 
-# === MATAR PROCESSOS ANTERIORES ===
-log "${YELLOW}Limpando processos anteriores...${NC}"
-pkill -f microsocks 2>/dev/null
-pkill -f "ssh.*rlwy" 2>/dev/null
-sleep 1
-
-# === INSTALAR DEPENDÊNCIAS ===
-log "${YELLOW}Verificando dependências...${NC}"
-for pkg_bin in "openssh:ssh" "sshpass:sshpass"; do
-    pkg_name="${pkg_bin%%:*}"
-    bin_name="${pkg_bin##*:}"
-    if ! command -v "$bin_name" &>/dev/null; then
-        pkg install -y "$pkg_name" 2>/dev/null
+instalar_dependencias() {
+    echo -e "${BLUE}[1/3] Verificando dependências...${NC}"
+    
+    # Verificar se node está instalado
+    if ! command -v node &> /dev/null; then
+        echo "  Instalando Node.js..."
+        pkg install -y nodejs-lts 2>/dev/null || pkg install -y nodejs
     fi
-    if command -v "$bin_name" &>/dev/null; then
-        echo -e "  ${GREEN}✓ $pkg_name OK${NC}"
+    
+    echo -e "${GREEN}  ✅ Dependências OK${NC}"
+}
+
+carregar_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        echo -e "${GREEN}[✓] Config carregada: $SERVER_HOST:$SERVER_PORT${NC}"
+        echo ""
+        echo -n "Usar esta configuração? (s/n): "
+        read -r usar
+        if [ "$usar" != "s" ] && [ "$usar" != "S" ] && [ "$usar" != "" ]; then
+            solicitar_config
+        fi
     else
-        echo -e "  ${RED}✗ $pkg_name FALHOU${NC}"; exit 1
+        solicitar_config
     fi
-done
+}
 
-if ! command -v microsocks &>/dev/null; then
-    pkg install -y microsocks 2>/dev/null || {
-        pkg install -y git make clang 2>/dev/null
-        rm -rf /tmp/microsocks
-        git clone https://github.com/rofl0r/microsocks.git /tmp/microsocks 2>/dev/null
-        cd /tmp/microsocks && make && cp microsocks "$PREFIX/bin/" 2>/dev/null
-        cd ~
+solicitar_config() {
+    echo ""
+    echo -e "${YELLOW}Configure a conexão com o Railway:${NC}"
+    echo ""
+    echo -n "  Host do Railway (ex: seu-app.railway.app): "
+    read -r SERVER_HOST
+    echo -n "  Porta (padrão 443): "
+    read -r input_port
+    SERVER_PORT="${input_port:-443}"
+    echo -n "  Tunnel Secret (padrão: tunnel_secret_key): "
+    read -r input_secret
+    TUNNEL_SECRET="${input_secret:-tunnel_secret_key}"
+    
+    # Salvar
+    mkdir -p "$HOME/.5gshare"
+    cat > "$CONFIG_FILE" << EOF
+SERVER_HOST="$SERVER_HOST"
+SERVER_PORT="$SERVER_PORT"
+TUNNEL_SECRET="$TUNNEL_SECRET"
+EOF
+    echo -e "${GREEN}  ✅ Configuração salva${NC}"
+}
+
+# === CLIENTE DE TÚNEL (Node.js) ===
+criar_cliente_tunnel() {
+    mkdir -p "$HOME/.5gshare"
+    cat > "$HOME/.5gshare/tunnel-client.js" << 'NODEJS_EOF'
+const net = require('net');
+
+const SERVER_HOST = process.env.SERVER_HOST;
+const SERVER_PORT = parseInt(process.env.SERVER_PORT || '443');
+const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'tunnel_secret_key';
+
+let socket = null;
+let reconnectTimer = null;
+let buffer = '';
+
+function connect() {
+    console.log(`[TUNNEL] Conectando a ${SERVER_HOST}:${SERVER_PORT}...`);
+    
+    socket = net.createConnection({ host: SERVER_HOST, port: SERVER_PORT }, () => {
+        console.log('[TUNNEL] Conectado! Autenticando...');
+        socket.write(TUNNEL_SECRET + '\n');
+    });
+    
+    socket.setKeepAlive(true, 15000);
+    socket.setTimeout(0);
+    
+    let authenticated = false;
+    
+    socket.on('data', (data) => {
+        if (!authenticated) {
+            const msg = data.toString('utf8').trim();
+            if (msg === 'OK') {
+                authenticated = true;
+                console.log('[TUNNEL] Autenticado! Túnel ativo.');
+                console.log('[TUNNEL] Seu PC agora pode usar a internet do seu 5G!');
+                console.log('');
+                // Iniciar keepalive
+                startKeepalive();
+            } else {
+                console.log('[TUNNEL] Autenticação falhou:', msg);
+                socket.destroy();
+            }
+            return;
+        }
+        
+        // Processar comandos do servidor
+        buffer += data.toString('utf8');
+        let newlineIndex;
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, newlineIndex);
+            buffer = buffer.slice(newlineIndex + 1);
+            processCommand(line);
+        }
+    });
+    
+    socket.on('close', () => {
+        console.log('[TUNNEL] Conexão fechada. Reconectando em 5s...');
+        authenticated = false;
+        scheduleReconnect();
+    });
+    
+    socket.on('error', (err) => {
+        console.log('[TUNNEL] Erro:', err.message);
+        scheduleReconnect();
+    });
+}
+
+function scheduleReconnect() {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+        connect();
+    }, 5000);
+}
+
+// Conexões ativas para o celular
+const activeConnections = new Map();
+
+function processCommand(line) {
+    try {
+        const msg = JSON.parse(line);
+        
+        if (msg.type === 'connect') {
+            // Servidor pede para conectar a um host
+            handleConnect(msg.id, msg.host, msg.port);
+        }
+        else if (msg.type === 'data') {
+            // Dados para uma conexão ativa
+            const conn = activeConnections.get(msg.id);
+            if (conn) {
+                const decoded = Buffer.from(msg.payload, 'base64');
+                conn.write(decoded);
+            }
+        }
+        else if (msg.type === 'close') {
+            // Fechar uma conexão
+            const conn = activeConnections.get(msg.id);
+            if (conn) {
+                conn.destroy();
+                activeConnections.delete(msg.id);
+            }
+        }
+        else if (msg.type === 'pong') {
+            // Resposta do keepalive
+        }
+    } catch (err) {
+        // Ignorar linhas inválidas
     }
-fi
-command -v microsocks &>/dev/null && echo -e "  ${GREEN}✓ microsocks OK${NC}" || { echo -e "  ${RED}✗ microsocks FALHOU${NC}"; exit 1; }
+}
 
-# === INICIAR MICROSOCKS LOCAL ===
-log "${YELLOW}Iniciando SOCKS5 local (porta $LOCAL_SOCKS_PORT)...${NC}"
-microsocks -i 0.0.0.0 -p "$LOCAL_SOCKS_PORT" &
-MICROSOCKS_PID=$!
-sleep 1
-if kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
-    echo -e "  ${GREEN}✓ Microsocks rodando (PID $MICROSOCKS_PID)${NC}"
-else
-    echo -e "  ${RED}✗ Microsocks falhou${NC}"; exit 1
-fi
+function handleConnect(id, host, port) {
+    console.log(`[CONN ${id}] Conectando: ${host}:${port}`);
+    
+    const remote = net.createConnection({ host, port }, () => {
+        console.log(`[CONN ${id}] Conectado!`);
+        // Informar servidor que conectou
+        sendToServer({ type: 'connected', id });
+    });
+    
+    remote.on('data', (data) => {
+        // Enviar dados de volta para o servidor
+        sendToServer({
+            type: 'data',
+            id,
+            payload: data.toString('base64')
+        });
+    });
+    
+    remote.on('close', () => {
+        activeConnections.delete(id);
+        sendToServer({ type: 'close', id });
+    });
+    
+    remote.on('error', (err) => {
+        console.log(`[CONN ${id}] Erro: ${err.message}`);
+        activeConnections.delete(id);
+        sendToServer({ type: 'error', id, error: err.message });
+    });
+    
+    // Timeout de conexão
+    remote.setTimeout(15000, () => {
+        console.log(`[CONN ${id}] Timeout`);
+        remote.destroy();
+        sendToServer({ type: 'error', id, error: 'timeout' });
+    });
+    
+    // Após conectar, remover timeout
+    remote.on('connect', () => {
+        remote.setTimeout(0);
+    });
+    
+    activeConnections.set(id, remote);
+}
 
-# === TESTAR CONECTIVIDADE ===
-log "${YELLOW}Testando conectividade...${NC}"
-if timeout 5 bash -c "echo >/dev/tcp/${RAILWAY_HOST}/${RAILWAY_PORT}" 2>/dev/null; then
-    echo -e "  ${GREEN}✓ Railway acessível${NC}"
-else
-    echo -e "  ${YELLOW}⚠ Não foi possível testar, tentando mesmo assim...${NC}"
-fi
+function sendToServer(msg) {
+    if (socket && !socket.destroyed) {
+        socket.write(JSON.stringify(msg) + '\n');
+    }
+}
 
-# === INFO ===
-echo ""
-echo -e "${CYAN}Configuração:${NC}"
-echo -e "  Servidor:  ${RAILWAY_HOST}:${RAILWAY_PORT}"
-echo -e "  Túnel:     servidor:${REMOTE_TUNNEL_PORT} ← celular:${LOCAL_SOCKS_PORT}"
-echo ""
-echo -e "${GREEN}═══════════════════════════════════════════${NC}"
-echo -e "${BOLD}Fingerprint Manager:${NC}"
-echo -e "  Tipo:      SOCKS5"
-echo -e "  Host:      ${RAILWAY_HOST}"
-echo -e "  Porta:     ${RAILWAY_PORT}"
-echo -e "  User/Pass: (vazio)"
-echo -e "${GREEN}═══════════════════════════════════════════${NC}"
-echo ""
+function startKeepalive() {
+    setInterval(() => {
+        sendToServer({ type: 'ping' });
+    }, 25000);
+}
 
-# === LOOP DE RECONEXÃO ===
-ATTEMPT=0
-BACKOFF=2
+// Iniciar
+connect();
 
-while true; do
-    ATTEMPT=$((ATTEMPT + 1))
+// Manter processo vivo
+process.on('SIGINT', () => {
+    console.log('\n[TUNNEL] Encerrando...');
+    if (socket) socket.destroy();
+    process.exit(0);
+});
 
-    # Verificar microsocks
-    if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
-        microsocks -i 0.0.0.0 -p "$LOCAL_SOCKS_PORT" &
-        MICROSOCKS_PID=$!
-        sleep 1
-    fi
+process.on('uncaughtException', (err) => {
+    console.log('[TUNNEL] Erro não tratado:', err.message);
+    scheduleReconnect();
+});
+NODEJS_EOF
+}
 
-    log "Conectando SSH (tentativa ${ATTEMPT})..."
+iniciar_tunnel() {
+    echo -e "${BLUE}[2/3] Criando cliente de túnel...${NC}"
+    criar_cliente_tunnel
+    
+    echo -e "${BLUE}[3/3] Conectando ao Railway...${NC}"
+    echo ""
+    
+    # Adquirir wake lock
+    termux-wake-lock 2>/dev/null || true
+    
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  TÚNEL ATIVO - Pressione Ctrl+C para parar${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # Executar o cliente Node.js
+    SERVER_HOST="$SERVER_HOST" \
+    SERVER_PORT="$SERVER_PORT" \
+    TUNNEL_SECRET="$TUNNEL_SECRET" \
+    node "$HOME/.5gshare/tunnel-client.js"
+}
 
-    sshpass -p "$TUNNEL_PASS" ssh \
-        -N -T \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o GlobalKnownHostsFile=/dev/null \
-        -o ServerAliveInterval=15 \
-        -o ServerAliveCountMax=3 \
-        -o ConnectTimeout=15 \
-        -o ExitOnForwardFailure=yes \
-        -o TCPKeepAlive=yes \
-        -o Compression=no \
-        -o LogLevel=ERROR \
-        -R 0.0.0.0:${REMOTE_TUNNEL_PORT}:127.0.0.1:${LOCAL_SOCKS_PORT} \
-        -p "$RAILWAY_PORT" \
-        "${TUNNEL_USER}@${RAILWAY_HOST}" 2>&1
-
-    EXIT_CODE=$?
-
-    if [ $EXIT_CODE -eq 0 ]; then
-        log "${GREEN}✓ Conexão encerrada normalmente${NC}"
-        BACKOFF=2
-        ATTEMPT=0
-    else
-        log "${RED}✗ Falha (código $EXIT_CODE)${NC}"
-    fi
-
-    log "Reconectando em ${BACKOFF}s..."
-    sleep $BACKOFF
-    BACKOFF=$((BACKOFF * 2))
-    [ $BACKOFF -gt 30 ] && BACKOFF=30
-done
+# === EXECUÇÃO ===
+mostrar_banner
+instalar_dependencias
+carregar_config
+iniciar_tunnel
