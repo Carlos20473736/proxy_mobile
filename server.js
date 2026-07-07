@@ -2,14 +2,12 @@ const net = require('net');
 
 /*
   ╔══════════════════════════════════════════════════════════════╗
-  ║  5G-SHARE v8.1 - SOCKS5 PURO                               ║
-  ║  Apenas SOCKS5 com autenticação | Pipe direto               ║
+  ║  5G-SHARE v8.2 - SOCKS5 SEM AUTH                            ║
+  ║  SOCKS5 sem autenticação | Pipe direto | Velocidade máxima  ║
   ╚══════════════════════════════════════════════════════════════╝
 */
 
 const PORT = parseInt(process.env.PORT || '7777');
-const PROXY_USER = process.env.PROXY_USER || '5guser';
-const PROXY_PASS = process.env.PROXY_PASS || 'senha123';
 const TUNNEL_SECRET = process.env.TUNNEL_SECRET || 'senha123';
 
 let controlSocket = null;
@@ -17,7 +15,7 @@ const pendingStreams = new Map();
 let nextId = 1;
 
 function log(msg) { console.log(`[${new Date().toISOString().slice(11,19)}] ${msg}`); }
-log(`v8.1 SOCKS5 PURO | Porta: ${PORT} | User: ${PROXY_USER}`);
+log(`v8.2 SOCKS5 NO-AUTH | Porta: ${PORT}`);
 
 // === SERVIDOR TCP ===
 const server = net.createServer({ noDelay: true }, (socket) => {
@@ -32,11 +30,9 @@ const server = net.createServer({ noDelay: true }, (socket) => {
     }
 
     // Texto: TUNNEL ou DATA
-    const str = chunk.toString();
-    const nl = str.indexOf('\n');
+    let buf = chunk.toString();
+    const nl = buf.indexOf('\n');
     if (nl === -1) {
-      // Esperar mais dados
-      let buf = str;
       const onMore = (d) => {
         buf += d.toString();
         const n = buf.indexOf('\n');
@@ -47,10 +43,7 @@ const server = net.createServer({ noDelay: true }, (socket) => {
       socket.on('data', onMore);
       return;
     }
-
-    const firstLine = str.slice(0, nl).trim();
-    const rest = str.slice(nl + 1);
-    routeText(socket, firstLine, rest);
+    routeText(socket, buf.slice(0, nl).trim(), buf.slice(nl + 1));
   });
 
   socket.on('error', () => {});
@@ -59,15 +52,14 @@ const server = net.createServer({ noDelay: true }, (socket) => {
 
 server.listen(PORT, '0.0.0.0', () => log(`Servidor ativo na porta ${PORT}`));
 
-// === ROTEAMENTO DE TEXTO (TUNNEL / DATA / Health) ===
+// === ROTEAMENTO TEXTO ===
 function routeText(socket, line, rest) {
   if (line.startsWith('TUNNEL:')) {
     handleTunnel(socket, line);
   } else if (line.startsWith('DATA:')) {
     handleDataConnection(socket, line, rest);
   } else {
-    // Health check simples (qualquer outra coisa)
-    const b = JSON.stringify({v:'8.1', tunnel: !!(controlSocket && !controlSocket.destroyed), pending: pendingStreams.size});
+    const b = JSON.stringify({v:'8.2', tunnel: !!(controlSocket && !controlSocket.destroyed), pending: pendingStreams.size});
     socket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(b)}\r\n\r\n${b}`);
     socket.end();
   }
@@ -92,7 +84,7 @@ function handleTunnel(socket, line) {
     try { socket.write('PING\n'); } catch(e) { clearInterval(iv); }
   }, 20000);
 
-  socket.on('data', () => {}); // Ignorar PONG
+  socket.on('data', () => {});
   socket.on('close', () => { if (controlSocket === socket) controlSocket = null; clearInterval(iv); log('Celular desconectou'); });
   socket.on('error', () => { if (controlSocket === socket) controlSocket = null; clearInterval(iv); });
 }
@@ -115,15 +107,14 @@ function handleDataConnection(socket, line, rest) {
 
   const pcSocket = pending.pcSocket;
 
-  // Responder SOCKS5 success ao PC
+  // Responder SOCKS5 success ao PC (sem bind address)
   pcSocket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
 
-  // Se rest tem dados, enviar para o PC
   if (rest && rest.length > 0) {
     pcSocket.write(Buffer.from(rest, 'binary'));
   }
 
-  // PIPE DIRETO - velocidade máxima!
+  // PIPE DIRETO
   socket.pipe(pcSocket);
   pcSocket.pipe(socket);
 
@@ -132,77 +123,56 @@ function handleDataConnection(socket, line, rest) {
   socket.on('close', () => pcSocket.destroy());
   pcSocket.on('close', () => socket.destroy());
 
-  log(`Stream #${id} pipe ativo`);
+  log(`#${id} pipe ativo`);
 }
 
-// === SOCKS5 PURO ===
+// === SOCKS5 SEM AUTENTICAÇÃO ===
 function handleSocks5(socket, chunk) {
   socket._ok = true;
   socket.setTimeout(0);
 
-  // chunk = [0x05, nMethods, ...methods]
-  // Responder: aceitar auth por user/pass (method 0x02)
-  socket.write(Buffer.from([0x05, 0x02]));
+  // Responder: NO AUTH REQUIRED (method 0x00)
+  socket.write(Buffer.from([0x05, 0x00]));
 
-  socket.once('data', (d) => {
-    // Subrequest de autenticação: [0x01, ulen, user..., plen, pass...]
-    if (d.length < 3 || d[0] !== 0x01) { socket.destroy(); return; }
-
-    const ulen = d[1];
-    if (d.length < 2 + ulen + 1) { socket.destroy(); return; }
-    const user = d.slice(2, 2 + ulen).toString();
-    const plen = d[2 + ulen];
-    if (d.length < 3 + ulen + plen) { socket.destroy(); return; }
-    const pass = d.slice(3 + ulen, 3 + ulen + plen).toString();
-
-    if (user !== PROXY_USER || pass !== PROXY_PASS) {
-      socket.write(Buffer.from([0x01, 0x01])); // auth failed
+  socket.once('data', (req) => {
+    // Request: [0x05, CMD, RSV, ATYP, ...]
+    if (req.length < 4 || req[0] !== 0x05 || req[1] !== 0x01) {
+      socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
       socket.destroy();
       return;
     }
-    socket.write(Buffer.from([0x01, 0x00])); // auth success
 
-    socket.once('data', (req) => {
-      // Request: [0x05, CMD, RSV, ATYP, ...]
-      if (req.length < 4 || req[0] !== 0x05 || req[1] !== 0x01) {
-        socket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-        socket.destroy();
-        return;
-      }
+    const atyp = req[3];
+    let host, port;
 
-      const atyp = req[3];
-      let host, port;
+    if (atyp === 0x01) { // IPv4
+      if (req.length < 10) { socket.destroy(); return; }
+      host = `${req[4]}.${req[5]}.${req[6]}.${req[7]}`;
+      port = req.readUInt16BE(8);
+    } else if (atyp === 0x03) { // Domain
+      const dlen = req[4];
+      if (req.length < 5 + dlen + 2) { socket.destroy(); return; }
+      host = req.slice(5, 5 + dlen).toString();
+      port = req.readUInt16BE(5 + dlen);
+    } else if (atyp === 0x04) { // IPv6
+      if (req.length < 22) { socket.destroy(); return; }
+      const parts = [];
+      for (let i = 0; i < 16; i += 2) parts.push(req.readUInt16BE(4 + i).toString(16));
+      host = parts.join(':');
+      port = req.readUInt16BE(20);
+    } else {
+      socket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+      socket.destroy();
+      return;
+    }
 
-      if (atyp === 0x01) { // IPv4
-        if (req.length < 10) { socket.destroy(); return; }
-        host = `${req[4]}.${req[5]}.${req[6]}.${req[7]}`;
-        port = req.readUInt16BE(8);
-      } else if (atyp === 0x03) { // Domain
-        const dlen = req[4];
-        if (req.length < 5 + dlen + 2) { socket.destroy(); return; }
-        host = req.slice(5, 5 + dlen).toString();
-        port = req.readUInt16BE(5 + dlen);
-      } else if (atyp === 0x04) { // IPv6
-        if (req.length < 22) { socket.destroy(); return; }
-        const parts = [];
-        for (let i = 0; i < 16; i += 2) parts.push(req.readUInt16BE(4 + i).toString(16));
-        host = parts.join(':');
-        port = req.readUInt16BE(20);
-      } else {
-        socket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-        socket.destroy();
-        return;
-      }
-
-      routeToTunnel(socket, host, port);
-    });
+    routeToTunnel(socket, host, port);
   });
 }
 
 // === ROTEAR PARA O TÚNEL ===
 function routeToTunnel(pcSocket, host, port) {
   if (!controlSocket || controlSocket.destroyed) {
-    // Connection refused
     pcSocket.write(Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
     pcSocket.destroy();
     return;
@@ -214,25 +184,20 @@ function routeToTunnel(pcSocket, host, port) {
   const timeout = setTimeout(() => {
     if (pendingStreams.has(id)) {
       pendingStreams.delete(id);
-      pcSocket.write(Buffer.from([0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])); // host unreachable
+      pcSocket.write(Buffer.from([0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
       pcSocket.destroy();
     }
   }, 15000);
 
   pendingStreams.set(id, { pcSocket, timeout });
-
-  // Pedir ao celular para conectar
   controlSocket.write(`OPEN:${id}:${host}:${port}\n`);
   log(`#${id} → ${host}:${port}`);
 }
 
-// Limpeza periódica
+// Limpeza
 setInterval(() => {
   for (const [id, p] of pendingStreams) {
-    if (p.pcSocket.destroyed) {
-      clearTimeout(p.timeout);
-      pendingStreams.delete(id);
-    }
+    if (p.pcSocket.destroyed) { clearTimeout(p.timeout); pendingStreams.delete(id); }
   }
 }, 30000);
 
